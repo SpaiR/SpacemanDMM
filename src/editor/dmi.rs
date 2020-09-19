@@ -3,7 +3,6 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::collections::hash_map::HashMap;
-use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use lodepng::{self, RGBA, Decoder, ColorType};
@@ -121,37 +120,12 @@ pub struct IconFile {
 
 impl IconFile {
     pub fn from_file(path: &Path) -> io::Result<IconFile> {
-        let path = &::dm::fix_case(path);
-        let mut decoder = Decoder::new();
-        decoder.info_raw_mut().colortype = ColorType::RGBA;
-        decoder.info_raw_mut().set_bitdepth(8);
-        decoder.remember_unknown_chunks(false);
-        let bitmap = match decoder.decode_file(path) {
-            Ok(::lodepng::Image::RGBA(bitmap)) => bitmap,
-            Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "not RGBA")),
-            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-        };
-
-        let mut metadata = Metadata {
-            width: bitmap.width as u32,
-            height: bitmap.height as u32,
-            states: Vec::new(),
-            state_names: BTreeMap::new(),
-        };
-        for (key, value) in decoder.info_png().text_keys_cstr() {
-            if key.to_str() == Ok("Description") {
-                if let Ok(value) = value.to_str() {
-                    metadata = Metadata::from_str(value);
-                }
-                break;
-            }
-        }
-
+        let (bitmap, metadata) = Metadata::from_file(path)?;
         Ok(IconFile {
-            metadata: metadata,
+            metadata,
             width: bitmap.width as u32,
             height: bitmap.height as u32,
-            bitmap: bitmap,
+            bitmap,
         })
     }
 
@@ -164,37 +138,9 @@ impl IconFile {
         ])
     }
 
+    #[inline]
     pub fn rect_of(&self, icon_state: &str, dir: Dir) -> Option<Rect> {
-        if self.metadata.states.is_empty() {
-            return Some((0, 0, self.metadata.width, self.metadata.height));
-        }
-        let state_index = match self.metadata.state_names.get(icon_state) {
-            Some(&i) => i,
-            None => return None,
-        };
-        let state = &self.metadata.states[state_index];
-
-        let dir_idx = match (state.dirs, dir) {
-            (Dirs::One, _) => 0,
-            (Dirs::Eight, Dir::Northwest) => 7,
-            (Dirs::Eight, Dir::Northeast) => 6,
-            (Dirs::Eight, Dir::Southwest) => 5,
-            (Dirs::Eight, Dir::Southeast) => 4,
-            (_, Dir::West) => 3,
-            (_, Dir::East) => 2,
-            (_, Dir::North) => 1,
-            (_, _) => 0,
-        };
-
-        let icon_index = state.offset as u32 + dir_idx;
-        let icon_count = self.width / self.metadata.width;
-        let (icon_x, icon_y) = (icon_index % icon_count, icon_index / icon_count);
-        Some((
-            icon_x * self.metadata.width,
-            icon_y * self.metadata.height,
-            self.metadata.width,
-            self.metadata.height,
-        ))
+        self.metadata.rect_of(self.width, icon_state, dir, 0)
     }
 }
 

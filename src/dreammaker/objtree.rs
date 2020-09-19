@@ -758,7 +758,7 @@ impl ObjectTree {
 
     fn assign_parent_types(&mut self, context: &Context) {
         for (path, &type_idx) in self.types.iter() {
-            let mut location = self.graph[type_idx.index()].location;
+            let mut location = self[type_idx].location;
             let idx = if path == "/datum" || path == "/list" || path == "/savefile" || path == "/world" {
                 // These types have no parent and cannot have one added. In the official compiler:
                 // - setting list or savefile/parent_type is denied with the same error as setting something's parent type to them;
@@ -778,6 +778,7 @@ impl ObjectTree {
 
                 NodeIndex::new(0)
             } else {
+                let constant_buf;
                 let mut parent_type_buf;
                 let parent_type = if path == "/atom" {
                     "/datum"
@@ -793,26 +794,43 @@ impl ObjectTree {
                     };
                     if let Some(var) = self[type_idx].vars.get("parent_type") {
                         location = var.value.location;
-                        if let Some(expr) = var.value.expression.clone() {
-                            match expr.simple_evaluate(var.value.location) {
-                                Ok(Constant::String(s)) => {
-                                    parent_type_buf = s;
-                                    parent_type = &parent_type_buf;
+
+                        // At this point, accept either expressions (user code)
+                        // or pre-evaluated constants (builtins).
+                        let constant = if let Some(constant) = var.value.constant.as_ref() {
+                            Ok(constant)
+                        } else if let Some(expr) = var.value.expression.clone() {
+                            match expr.simple_evaluate(location) {
+                                Ok(constant) => {
+                                    constant_buf = constant;
+                                    Ok(&constant_buf)
                                 }
-                                Ok(Constant::Prefab(Pop { ref path, ref vars })) if vars.is_empty() => {
-                                    parent_type_buf = String::new();
-                                    for piece in path.iter() {
-                                        parent_type_buf.push('/');
-                                        parent_type_buf.push_str(&piece);
-                                    }
-                                    parent_type = &parent_type_buf;
+                                Err(e) => Err(e),
+                            }
+                        } else if path == "/client" {
+                            Ok(Constant::EMPTY_STRING)
+                        } else {
+                            // A weird situation which should not happen.
+                            Err(DMError::new(location, format!("missing {}/parent_type", path)))
+                        };
+
+                        match constant {
+                            Ok(Constant::String(s)) => {
+                                parent_type = s;
+                            }
+                            Ok(Constant::Prefab(Pop { ref path, ref vars })) if vars.is_empty() => {
+                                parent_type_buf = String::new();
+                                for piece in path.iter() {
+                                    parent_type_buf.push('/');
+                                    parent_type_buf.push_str(&piece);
                                 }
-                                Ok(other) => {
-                                    context.register_error(DMError::new(location, format!("bad parent_type: {}", other)));
-                                }
-                                Err(e) => {
-                                    context.register_error(e);
-                                }
+                                parent_type = &parent_type_buf;
+                            }
+                            Ok(other) => {
+                                context.register_error(DMError::new(location, format!("value of {}/parent_type must be a string or typepath, got {}", path, other)));
+                            }
+                            Err(e) => {
+                                context.register_error(e);
                             }
                         }
                     }
@@ -1129,32 +1147,16 @@ impl ObjectTree {
     pub(crate) fn add_builtin_var(
         &mut self,
         elems: &[&'static str],
-        value: Expression,
+        value: Constant,
     ) -> Result<(), DMError> {
-        self.add_var(
-            Location::builtins(),
-            elems.iter().copied(),
-            elems.len() + 1,
-            value,
-            Default::default(),
-            Default::default(),
-        )
-    }
+        let location = Location::builtins();
+        let mut path = elems.iter().copied();
+        let len = elems.len() + 1;
 
-    // an entry which is definitely a var because a value is specified
-    fn add_var<'a, I: Iterator<Item = &'a str>>(
-        &mut self,
-        location: Location,
-        mut path: I,
-        len: usize,
-        expr: Expression,
-        comment: DocCollection,
-        suffix: VarSuffix,
-    ) -> Result<(), DMError> {
         let (parent, initial) = self.get_from_path(location, &mut path, len)?;
-        if let Some(type_var) = self.register_var(location, parent, initial, path, comment, suffix)? {
+        if let Some(type_var) = self.register_var(location, parent, initial, path, Default::default(), Default::default())? {
             type_var.value.location = location;
-            type_var.value.expression = Some(expr);
+            type_var.value.constant = Some(value);
             Ok(())
         } else {
             Err(DMError::new(location, "var must have a name"))

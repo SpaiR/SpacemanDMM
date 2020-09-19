@@ -222,13 +222,38 @@ pub enum Frames {
 }
 
 impl Metadata {
-    /// Read the metadata from a given file.
-    ///
-    /// Prefer to call `IconFile::from_file`, which can read both metadata and
-    /// image contents at one time.
-    pub fn from_file(path: &Path) -> io::Result<Metadata> {
-        let text = read_metadata(path)?;
-        Ok(parse_metadata(&text))
+    /// Read the bitmap and DMI metadata from a given file in a single pass.
+    pub fn from_file(path: &Path) -> io::Result<(lodepng::Bitmap<lodepng::RGBA>, Metadata)> {
+        let path = &crate::fix_case(path);
+        let mut decoder = Decoder::new();
+        decoder.info_raw_mut().colortype = lodepng::ColorType::RGBA;
+        decoder.info_raw_mut().set_bitdepth(8);
+        decoder.remember_unknown_chunks(false);
+        let bitmap = match decoder.decode_file(path) {
+            Ok(::lodepng::Image::RGBA(bitmap)) => bitmap,
+            Ok(_) => return Err(io::Error::new(io::ErrorKind::InvalidData, "not RGBA")),
+            Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+        };
+
+        let metadata = Metadata::from_decoder(bitmap.width as u32, bitmap.height as u32, &decoder);
+        Ok((bitmap, metadata))
+    }
+
+    fn from_decoder(width: u32, height: u32, decoder: &Decoder) -> Metadata {
+        for (key, value) in decoder.info_png().text_keys() {
+            if key == b"Description" {
+                if let Ok(value) = std::str::from_utf8(value) {
+                    return Metadata::from_str(value);
+                }
+                break;
+            }
+        }
+        Metadata {
+            width,
+            height,
+            states: Default::default(),
+            state_names: Default::default(),
+        }
     }
 
     /// Parse metadata from a `Description` string.
@@ -236,11 +261,54 @@ impl Metadata {
     pub fn from_str(data: &str) -> Metadata {
         parse_metadata(data)
     }
+
+    pub fn rect_of(&self, bitmap_width: u32, icon_state: &str, dir: Dir, frame: u32) -> Option<(u32, u32, u32, u32)> {
+        if self.states.is_empty() {
+            return Some((0, 0, self.width, self.height));
+        }
+        let state_index = match self.state_names.get(icon_state) {
+            Some(&i) => i,
+            None if icon_state == "" => 0,
+            None => return None,
+        };
+        let state = &self.states[state_index];
+        let icon_index = state.index_of_frame(dir, frame);
+
+        let icon_count = bitmap_width / self.width;
+        let (icon_x, icon_y) = (icon_index % icon_count, icon_index / icon_count);
+        Some((
+            icon_x * self.width,
+            icon_y * self.height,
+            self.width,
+            self.height,
+        ))
+    }
 }
 
 impl State {
     pub fn num_sprites(&self) -> usize {
         self.dirs.len() * self.frames.len()
+    }
+
+    pub fn index_of_dir(&self, dir: Dir) -> u32 {
+        let dir_idx = match (self.dirs, dir) {
+            (Dirs::One, _) => 0,
+            (Dirs::Eight, Dir::Northwest) => 7,
+            (Dirs::Eight, Dir::Northeast) => 6,
+            (Dirs::Eight, Dir::Southwest) => 5,
+            (Dirs::Eight, Dir::Southeast) => 4,
+            (_, Dir::West) => 3,
+            (_, Dir::East) => 2,
+            (_, Dir::North) => 1,
+            (_, _) => 0,
+        };
+
+        self.offset as u32 + dir_idx
+    }
+
+    #[inline]
+    pub fn index_of_frame(&self, dir: Dir, frame: u32) -> u32 {
+        self.index_of_dir(dir) + frame * self.dirs.len() as u32
     }
 }
 
@@ -274,26 +342,6 @@ impl Frames {
 
 // ----------------------------------------------------------------------------
 // Metadata parser
-
-fn read_metadata(path: &Path) -> io::Result<String> {
-    let path = &crate::fix_case(path);
-    let mut decoder = Decoder::new();
-    decoder.remember_unknown_chunks(false);
-    match decoder.decode_file(path) {
-        Ok(_) => {}
-        Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
-    }
-
-    for (key, value) in decoder.info_png().text_keys_cstr() {
-        if key.to_str() == Ok("Description") {
-            if let Ok(value) = value.to_str() {
-                return Ok(value.to_owned());
-            }
-        }
-    }
-
-    Ok(String::new())
-}
 
 fn parse_metadata(data: &str) -> Metadata {
     let mut metadata = Metadata {

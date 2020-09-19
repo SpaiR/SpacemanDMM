@@ -1,9 +1,11 @@
 //! BYOND built-in types, procs, and vars.
 
+use builtins_proc_macro::entries;
+
 use super::objtree::*;
-use super::ast::*;
 use super::{Location, DMError};
 use super::preprocessor::{DefineMap, Define};
+use super::constants::Constant;
 
 const DM_VERSION: i32 = 513;
 const DM_BUILD: i32 = 1527;
@@ -182,41 +184,34 @@ pub fn default_defines(defines: &mut DefineMap) {
 
 /// Register BYOND builtins into the specified object tree.
 pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
-    macro_rules! entries {
-        ($($($elem:ident)/ * $(($($arg:ident $(= $ignored:expr)*),*))* $(= $val:expr)*;)*) => {
-            $(loop {
-                #![allow(unreachable_code)]
-                let elems = [$(stringify!($elem)),*];
-                $(
-                    tree.add_builtin_var(&elems, $val)?;
-                    break;
-                )*
-                $(
-                    tree.add_builtin_proc(&elems, &[$(stringify!($arg)),*])?;
-                    break;
-                )*
-                tree.add_builtin_entry(&elems)?;
-                break;
-            })*
+    macro_rules! one_entry {
+        ($($elem:ident)/ *) => {
+            tree.add_builtin_entry(&[$(stringify!($elem)),*])?;
+        };
+        ($($elem:ident)/ * = $val:expr) => {
+            tree.add_builtin_var(&[$(stringify!($elem)),*], $val)?;
+        };
+        ($($elem:ident)/ * ($($arg:ident $(= $ignored:expr)*),*)) => {
+            tree.add_builtin_proc(&[$(stringify!($elem)),*], &[$(stringify!($arg)),*])?;
         }
     }
 
     macro_rules! path {
         ($(/$elem:ident)*) => {
-            Expression::from(Term::Prefab(Prefab {
-                path: vec![$((PathOp::Slash, stringify!($elem).to_owned())),*],
+            Constant::Prefab(super::constants::Pop {
+                path: vec![$(stringify!($elem).to_owned()),*],
                 vars: Default::default(),
-            }))
+            })
         }
     }
     macro_rules! int {
         ($e:expr) => {
-            Expression::from(Term::Int($e))
+            Constant::Int($e)
         };
     }
     macro_rules! string {
         ($e:expr) => {
-            Expression::from(Term::String($e.into()))
+            Constant::String($e.into())
         };
     }
 
@@ -327,6 +322,10 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         // wave filter / ripple filter
         var/const/WAVE_SIDEWAYS = int!(1);
         var/const/WAVE_BOUNDED = int!(2);
+
+        // outline filter
+        var/const/OUTLINE_SHARP = int!(1);
+        var/const/OUTLINE_SQUARE = int!(2);
 
         // global procs
         proc/abs(A);
@@ -690,7 +689,7 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         world/var/maxy;
         world/var/maxz;
         world/var/mob/mob = path!(/mob);
-        world/var/name = Expression::from(Term::String("byond".into()));
+        world/var/name = string!("byond");
         world/var/params;
         world/var/port;
         world/var/realtime;
@@ -751,7 +750,7 @@ pub fn register_builtins(tree: &mut ObjectTree) -> Result<(), DMError> {
         client/var/connection;
         client/var/control_freak = int!(0);
         client/var/computer_id;
-        client/var/default_verb_category = Expression::from(Term::String("Commands".into()));
+        client/var/default_verb_category = string!("Commands");
         client/var/dir = int!(1);  // NORTH
         client/var/edge_limit;
         client/var/eye;

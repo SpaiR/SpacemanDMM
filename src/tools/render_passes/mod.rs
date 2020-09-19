@@ -6,12 +6,14 @@ mod transit_tube;
 mod random;
 mod structures;
 mod icon_smoothing;
+mod icon_smoothing_2020;
 mod smart_cables;
 
 pub use self::transit_tube::TransitTube;
 pub use self::random::Random;
 pub use self::structures::{GravityGen, Spawners};
-pub use self::icon_smoothing::IconSmoothing;
+pub use self::icon_smoothing::IconSmoothing as IconSmoothing2016;
+pub use self::icon_smoothing_2020::IconSmoothing;
 pub use self::smart_cables::SmartCables;
 
 /// A map rendering pass.
@@ -107,7 +109,8 @@ pub const RENDER_PASSES: &[RenderPassInfo] = &[
     pass!(Wires, "only-powernet", "Render only power cables.", false),
     pass!(Pipes, "only-pipenet", "Render only atmospheric pipes.", false),
     pass!(FancyLayers, "fancy-layers", "Layer atoms according to in-game rules.", true),
-    pass!(IconSmoothing, "icon-smoothing", "Emulate the icon smoothing subsystem.", true),
+    pass!(IconSmoothing2016, "icon-smoothing-2016", "Emulate the icon smoothing subsystem (xxalpha, 2016).", false),
+    pass!(IconSmoothing, "icon-smoothing", "Emulate the icon smoothing subsystem (Rohesie, 2020).", true),
     pass!(SmartCables, "smart-cables", "Handle smart cable layout.", true),
 ];
 
@@ -424,11 +427,11 @@ impl RenderPass for FancyLayers {
 fn unary_aboveground(atom: &Atom, objtree: &ObjectTree) -> Option<&'static str> {
     Some(match atom.get_var("icon_state", objtree) {
         &Constant::String(ref text) => match &**text {
-            "vent_map-1" | "vent_map-2" | "vent_map-3" => "vent_off",
-            "vent_map_on-1" | "vent_map_on-2" | "vent_map_on-3" => "vent_out",
-            "vent_map_siphon_on-1" | "vent_map_siphon_on-2" | "vent_map_siphon_on-3" => "vent_in",
-            "scrub_map-1" | "scrub_map-2" | "scrub_map-3" => "scrub_off",
-            "scrub_map_on-1" | "scrub_map_on-2" | "scrub_map_on-3" => "scrub_on",
+            "vent_map-1" | "vent_map-2" | "vent_map-3" | "vent_map-4" => "vent_off",
+            "vent_map_on-1" | "vent_map_on-2" | "vent_map_on-3" | "vent_map_on-4" => "vent_out",
+            "vent_map_siphon_on-1" | "vent_map_siphon_on-2" | "vent_map_siphon_on-3" | "vent_map_siphon_on-4" => "vent_in",
+            "scrub_map-1" | "scrub_map-2" | "scrub_map-3" | "scrub_map-4" => "scrub_off",
+            "scrub_map_on-1" | "scrub_map_on-2" | "scrub_map_on-3" | "scrub_map_on-4" => "scrub_on",
             _ => return None,
         },
         _ => return None,

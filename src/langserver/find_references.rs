@@ -27,8 +27,8 @@ impl ReferencesTable {
         // Insert the "definition" locations for the types and such
         objtree.root().recurse(&mut |ty| {
             tab.uses.insert(ty.id, References {
-                references: vec![ty.location],
-                implementations: vec![],
+                references: vec![],
+                implementations: vec![ty.location],
             });
             for (name, var) in ty.vars.iter() {
                 if let Some(decl) = ty.get_var_declaration(name) {
@@ -608,10 +608,14 @@ impl<'o> WalkProc<'o> {
         StaticType::None
     }
 
-    fn visit_call(&mut self, location: Location, src: TypeRef<'o>, proc: ProcRef, args: &'o [Expression], _is_exact: bool) -> StaticType<'o> {
+    fn visit_call(&mut self, location: Location, src: TypeRef<'o>, proc: ProcRef, args: &'o [Expression], is_exact: bool) -> StaticType<'o> {
         // register use of symbol
-        if let Some(decl) = src.get_proc_declaration(proc.name()) {
-            self.tab.use_symbol(decl.id, location);
+        if !is_exact {
+            // Only include uses of the symbol by name, not `.()` or `..()`
+            // or `new /datum()`.
+            if let Some(decl) = src.get_proc_declaration(proc.name()) {
+                self.tab.use_symbol(decl.id, location);
+            }
         }
 
         // identify and register kwargs used

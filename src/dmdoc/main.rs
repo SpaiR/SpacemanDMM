@@ -44,7 +44,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
     // command-line args
     let mut environment = None;
     let mut output_path = "dmdoc".to_owned();
-    let mut modules_path = "code".to_owned();
+    let mut index_path = None;
 
     let mut args = std::env::args();
     let _ = args.next();  // skip executable name
@@ -56,15 +56,14 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
             environment = Some(args.next().expect("must specify a value for -e"));
         } else if arg == "--output" {
             output_path = args.next().expect("must specify a value for --output");
-        } else if arg == "--modules" {
-            modules_path = args.next().expect("must specify a value for --modules");
+        } else if arg == "--index" {
+            index_path = Some(args.next().expect("must specify a value for --index"));
         } else {
             return Err(format!("unknown argument: {}", arg).into());
         }
     }
 
     let output_path: &Path = output_path.as_ref();
-    let modules_path: &Path = modules_path.as_ref();
 
     // parse environment
     let environment = match environment {
@@ -91,6 +90,16 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
     let define_history = pp.finalize();
 
     println!("collating documented types");
+
+    // Any top-level directory which is `#include`d in the `.dme` (most
+    // importantly "code", but also "_maps", "interface", and any downstream
+    // modular folders) will be searched for `.md` files to include in the docs.
+    let mut code_directories = std::collections::HashSet::new();
+    context.file_list().for_each(|path| {
+        if let Some(std::path::Component::Normal(first)) = path.components().next() {
+            code_directories.insert(first.to_owned());
+        }
+    });
 
     // get a read on which types *have* docs
     let mut types_with_docs = BTreeMap::new();
@@ -273,28 +282,29 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // search the code tree for Markdown files
+    for modules_path in code_directories {
+        for entry in walkdir::WalkDir::new(modules_path).into_iter().filter_entry(is_visible) {
+            let entry = entry?;
+            let path = entry.path();
+
+            if let Some(buf) = read_as_markdown(path)? {
+                if Some(path) != index_path.as_ref().map(Path::new) {
+                    let module = module_entry(&mut modules1, &path);
+                    module.items_wip.push((0, ModuleItem::DocComment(DocComment {
+                        kind: CommentKind::Block,
+                        target: DocTarget::EnclosingItem,
+                        text: buf,
+                    })));
+                }
+            }
+        }
+    }
+
+    // Incorporate the index file if requested.
     let mut index_docs = None;
-    for entry in walkdir::WalkDir::new(modules_path).into_iter().filter_entry(is_visible) {
-        use std::io::Read;
-
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension() != Some("md".as_ref()) {
-            continue;
-        }
-
-        let mut buf = String::new();
-        File::open(path)?.read_to_string(&mut buf)?;
-        if path == modules_path.join("README.md") {
-            index_docs = Some(DocBlock::parse_with_title(&buf, Some(broken_link_callback)));
-        } else {
-            let module = module_entry(&mut modules1, &path);
-            module.items_wip.push((0, ModuleItem::DocComment(DocComment {
-                kind: CommentKind::Block,
-                target: DocTarget::EnclosingItem,
-                text: buf,
-            })));
-        }
+    if let Some(index_path) = index_path {
+        let buf = read_as_markdown(index_path.as_ref())?.expect("file for --index must be .md or .txt");
+        index_docs = Some(DocBlock::parse_with_title(&buf, Some(broken_link_callback)));
     }
 
     // collate types which have docs
@@ -318,6 +328,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
                 .get("name")
                 .and_then(|v| v.value.constant.as_ref())
                 .and_then(|c| c.as_str())
+                .map(strip_propriety)
                 .unwrap_or("")
                 .into();
         }
@@ -632,7 +643,7 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
             html: index_docs.as_ref().map(|(_, docs)| &docs.html[..]),
             modules: build_index_tree(modules.iter().map(|(_path, module)| IndexTree {
                 htmlname: &module.htmlname,
-                full_name: &module.orig_filename,
+                full_name: &module.htmlname,
                 self_name: match module.name {
                     None => last_element(&module.htmlname),
                     Some(ref t) => t.as_str(),
@@ -719,7 +730,11 @@ fn main2() -> Result<(), Box<dyn std::error::Error>> {
 // Helpers
 
 fn module_path(path: &Path) -> String {
-    path.with_extension("").display().to_string().replace("\\", "/")
+    let mut path = path.with_extension("");
+    if path.file_name().map_or(false, |x| x.to_string_lossy().eq_ignore_ascii_case("README")) {
+        path.pop();
+    }
+    path.display().to_string().replace("\\", "/")
 }
 
 fn module_entry<'a, 'b>(modules: &'a mut BTreeMap<String, Module1<'b>>, path: &Path) -> &'a mut Module1<'b> {
@@ -847,6 +862,34 @@ fn git_info(git: &mut Git) -> Result<(), git2::Error> {
         }
     }
     Ok(())
+}
+
+fn read_as_markdown(path: &Path) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+
+    let ext = path.extension();
+    let is_md = ext == Some("md".as_ref());
+    let is_txt = ext == Some("txt".as_ref());
+    if is_md || is_txt {
+        let mut buf = String::new();
+        if is_txt {
+            buf.push_str("```\n");
+        }
+        File::open(path)?.read_to_string(&mut buf)?;
+        if is_txt {
+            buf.push_str("```");
+        }
+        Ok(Some(buf))
+    } else {
+        Ok(None)
+    }
+}
+
+fn strip_propriety(name: &str) -> &str {
+    name
+        .trim_start_matches("\\proper")
+        .trim_start_matches("\\improper")
+        .trim_start()
 }
 
 // ----------------------------------------------------------------------------
