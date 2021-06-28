@@ -6,6 +6,7 @@ use std::fmt;
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct DocCollection {
     elems: Vec<DocComment>,
+    pub builtin_docs: BuiltinDocs,
 }
 
 impl DocCollection {
@@ -39,15 +40,15 @@ impl DocCollection {
                         continue;
                     }
                     // block comments are always paragraphs
-                    output.push_str("\n");
+                    output.push('\n');
                     if simplify(&mut output, &each.text, '*') {
-                        output.push_str("\n");
+                        output.push('\n');
                     }
                 },
                 CommentKind::Line => {
                     // line comments are paragraphs only if there are blanks
                     line_comments.push_str(&each.text);
-                    line_comments.push_str("\n");
+                    line_comments.push('\n');
                 },
             }
         }
@@ -182,7 +183,7 @@ fn simplify(out: &mut String, text: &str, ignore_char: char) -> bool {
         }
         // ...but include them in the middle.
         for _ in 0..newlines {
-            out.push_str("\n");
+            out.push('\n');
         }
         out.push_str(&line[prefix_len..line.len() - suffix_len]);
         anything = true;
@@ -202,4 +203,18 @@ pub enum DocTarget {
     FollowingItem,
     /// Starting with `!`, referring to the enclosing item.
     EnclosingItem,
+}
+
+/// Information about where builtin docs can be found.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BuiltinDocs {
+    None,
+    /// A DM reference hash such as "/DM/vars".
+    ReferenceHash(&'static str),
+}
+
+impl Default for BuiltinDocs {
+    fn default() -> Self {
+        BuiltinDocs::None
+    }
 }

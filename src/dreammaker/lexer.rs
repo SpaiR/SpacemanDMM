@@ -6,6 +6,7 @@ use std::borrow::Cow;
 
 use super::{DMError, Location, HasLocation, FileId, Context, Severity};
 use super::docs::*;
+use super::ast::Ident;
 
 macro_rules! table {
     (
@@ -76,6 +77,7 @@ table! {
     "%=",  ModAssign;
     "&",   BitAnd;
     "&&",  And;
+    "&&=", AndAssign;
     "&=",  BitAndAssign;
     "'",   SingleQuote;
     "(",   LParen;
@@ -98,6 +100,7 @@ table! {
     "//",  LineComment;
     "/=",  DivAssign;
     ":",   Colon -> CloseColon;
+    ":=",  AssignInto;
     ";",   Semicolon;
     "<",   Less;
     "<<",  LShift;
@@ -113,6 +116,7 @@ table! {
     "?",   QuestionMark;
     "?.",  SafeDot;
     "?:",  SafeColon;
+    "?[",  SafeLBracket;
     "[",   LBracket;
     "]",   RBracket;
     "^",   BitXor;
@@ -122,6 +126,7 @@ table! {
     "|",   BitOr;
     "|=",  BitOrAssign;
     "||",  Or;
+    "||=", OrAssign;
     "}",   RBrace;
     "~",   BitNot;
     "~!",  NotEquiv;
@@ -144,18 +149,18 @@ static SPEEDY_TABLE: [(usize, usize); 127] = [
     (0, 0), (0, 1), (1, 2), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
     (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
     (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
-    (2, 3), (3, 5), (5, 6), (6, 8), (0, 0), (8, 10), (10, 13), (13, 14),
-    (14, 15), (15, 16), (16, 19), (19, 22), (22, 23), (23, 26), (26, 29), (29, 33),
+    (2, 3), (3, 5), (5, 6), (6, 8), (0, 0), (8, 10), (10, 14), (14, 15),
+    (15, 16), (16, 17), (17, 20), (20, 23), (23, 24), (24, 27), (27, 30), (30, 34),
     (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
-    (0, 0), (0, 0), (33, 34), (34, 35), (35, 40), (40, 42), (42, 46), (46, 49),
-    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
-    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
-    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
-    (0, 0), (0, 0), (0, 0), (49, 50), (0, 0), (50, 51), (51, 53), (0, 0),
+    (0, 0), (0, 0), (34, 36), (36, 37), (37, 42), (42, 44), (44, 48), (48, 52),
     (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
     (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
     (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
-    (0, 0), (0, 0), (0, 0), (53, 55), (55, 58), (58, 59), (59, 62)];
+    (0, 0), (0, 0), (0, 0), (52, 53), (0, 0), (53, 54), (54, 56), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0), (0, 0),
+    (0, 0), (0, 0), (0, 0), (56, 58), (58, 62), (62, 63), (63, 66)];
 
 #[test]
 fn make_speedy_table() {
@@ -173,10 +178,16 @@ fn make_speedy_table() {
     }
 
     let mut table = vec![];
+    let mut prev = None;
     for (i, (each, _)) in PUNCT_TABLE.iter().enumerate() {
         if each.chars().any(|c| c.is_alphanumeric()) {
             continue;
         }
+
+        if let Some(prev) = prev {
+            assert!(each > prev, "out-of-order: {:?} is not greater than {:?}", each, prev);
+        }
+        prev = Some(each);
 
         let b = each.as_bytes()[0] as usize;
         if b >= table.len() {
@@ -231,7 +242,7 @@ pub enum Token {
     /// A punctuation symbol.
     Punct(Punctuation),
     /// A raw identifier or keyword. Indicates whether it is followed by whitespace.
-    Ident(String, bool),
+    Ident(Ident, bool),
     /// A string literal with no interpolation.
     String(String),
     /// The opening portion of an interpolated string. Followed by an expression.
@@ -268,6 +279,7 @@ impl Token {
                 Mod |
                 And |
                 BitAndAssign |
+                AndAssign |
                 Mul |
                 Pow |
                 MulAssign |
@@ -277,6 +289,7 @@ impl Token {
                 SubAssign |
                 DivAssign |
                 Colon |
+                AssignInto |
                 Less |
                 LShift |
                 LShiftAssign |
@@ -290,6 +303,7 @@ impl Token {
                 QuestionMark |
                 BitXorAssign |
                 BitOrAssign |
+                OrAssign |
                 Or => return true,
                 _ => {}
             }
@@ -313,13 +327,12 @@ impl Token {
 
     /// Check whether this token is whitespace.
     pub fn is_whitespace(&self) -> bool {
-        match *self {
-            Token::Punct(Punctuation::Tab) |
-            Token::Punct(Punctuation::Newline) |
-            Token::Punct(Punctuation::Space) |
-            Token::Eof => true,
-            _ => false
-        }
+        matches!(*self,
+            Token::Punct(Punctuation::Tab)
+            | Token::Punct(Punctuation::Newline)
+            | Token::Punct(Punctuation::Space)
+            | Token::Eof
+        )
     }
 
     /// Check whether this token matches a given identifier.
@@ -631,12 +644,18 @@ impl<'ctx> Lexer<'ctx> {
 
     /// Create a new lexer from a reader.
     pub fn from_read<R: Read>(context: &'ctx Context, file: FileId, read: R) -> Result<Self, DMError> {
-        Ok(Lexer::new(context, file, buffer_read(file, read)?))
+        let start_time = std::time::Instant::now();
+        let input = buffer_read(file, read)?;
+        context.add_io_time(start_time.elapsed());
+        Ok(Lexer::new(context, file, input))
     }
 
     /// Create a new lexer from a reader.
     pub fn from_file(context: &'ctx Context, file: FileId, path: &std::path::Path) -> Result<Self, DMError> {
-        Ok(Lexer::new(context, file, buffer_file(file, path)?))
+        let start_time = std::time::Instant::now();
+        let input = buffer_file(file, path)?;
+        context.add_io_time(start_time.elapsed());
+        Ok(Lexer::new(context, file, input))
     }
 
     pub fn remaining(&self) -> &[u8] {

@@ -82,6 +82,8 @@ impl<'a, T: fmt::Display + ?Sized> fmt::Display for Around<'a, T> {
     }
 }
 
+pub type Ident = String;
+
 /// The DM path operators.
 ///
 /// Which path operator is used typically only matters at the start of a path.
@@ -112,9 +114,9 @@ impl fmt::Display for PathOp {
 }
 
 /// A (typically absolute) tree path where the path operator is irrelevant.
-pub type TreePath = Vec<String>;
+pub type TreePath = Vec<Ident>;
 
-pub struct FormatTreePath<'a>(pub &'a [String]);
+pub struct FormatTreePath<'a>(pub &'a [Ident]);
 
 impl<'a> fmt::Display for FormatTreePath<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -126,9 +128,9 @@ impl<'a> fmt::Display for FormatTreePath<'a> {
 }
 
 /// A series of identifiers separated by path operators.
-pub type TypePath = Vec<(PathOp, String)>;
+pub type TypePath = Vec<(PathOp, Ident)>;
 
-pub struct FormatTypePath<'a>(pub &'a [(PathOp, String)]);
+pub struct FormatTypePath<'a>(pub &'a [(PathOp, Ident)]);
 
 impl<'a> fmt::Display for FormatTypePath<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -207,8 +209,11 @@ pub enum AssignOp {
     MulAssign,
     DivAssign,
     ModAssign,
+    AssignInto,
     BitAndAssign,
+    AndAssign,
     BitOrAssign,
+    OrAssign,
     BitXorAssign,
     LShiftAssign,
     RShiftAssign,
@@ -224,9 +229,12 @@ impl fmt::Display for AssignOp {
             MulAssign => "*=",
             DivAssign => "/=",
             ModAssign => "%=",
+            AssignInto => ":=",
             BitAndAssign => "&=",
+            AndAssign => "&&=",
             BitXorAssign => "^=",
             BitOrAssign => "|=",
+            OrAssign => "||=",
             LShiftAssign => "<<=",
             RShiftAssign => ">>=",
         })
@@ -278,7 +286,7 @@ augmented! {
 #[derive(Clone, PartialEq, Debug)]
 pub struct Prefab {
     pub path: TypePath,
-    pub vars: LinkedHashMap<String, Expression>,
+    pub vars: LinkedHashMap<Ident, Expression>,
 }
 
 impl From<TypePath> for Prefab {
@@ -291,7 +299,7 @@ impl From<TypePath> for Prefab {
 }
 
 /// Formatting helper for variable arrays.
-pub struct FormatVars<'a, E>(pub &'a LinkedHashMap<String, E>);
+pub struct FormatVars<'a, E>(pub &'a LinkedHashMap<Ident, E>);
 
 impl<'a, E: fmt::Display> fmt::Display for FormatVars<'a, E> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -317,11 +325,11 @@ pub enum NewType {
     /// Implicit type, taken from context.
     Implicit,
     /// A prefab to be instantiated.
-    Prefab(Prefab),
+    Prefab(Box<Prefab>),
     /// A "mini-expression" in which to find the prefab to instantiate.
     MiniExpr {
-        ident: String,
-        fields: Vec<IndexOrField>,
+        ident: Ident,
+        fields: Vec<Field>,
     },
 }
 
@@ -334,7 +342,7 @@ pub enum Expression {
         /// The unary operations applied to this value, in reverse order.
         unary: Vec<UnaryOp>,
         /// The term of the expression.
-        term: Spanned<Term>,
+        term: Box<Spanned<Term>>,
         /// The follow operations applied to this value.
         follow: Vec<Spanned<Follow>>,
     },
@@ -414,8 +422,8 @@ impl Expression {
                     BinaryOp::LessEq |
                     BinaryOp::GreaterEq |
                     BinaryOp::And |
-                    BinaryOp::Or => return true,
-                    _ => return false,
+                    BinaryOp::Or => true,
+                    _ => false,
                 }
             },
             _ => false,
@@ -435,9 +443,9 @@ impl Expression {
                     }
                 }
                 if negation {
-                    return Some(!truthy)
+                    Some(!truthy)
                 } else {
-                    return Some(truthy)
+                    Some(truthy)
                 }
             },
             Expression::BinaryOp { op, lhs, rhs } => {
@@ -447,7 +455,7 @@ impl Expression {
                 guard!(let Some(rhtruth) = rhs.is_truthy() else {
                     return None
                 });
-                return match op {
+                match op {
                     BinaryOp::And => Some(lhtruth && rhtruth),
                     BinaryOp::Or => Some(lhtruth || rhtruth),
                     _ => None,
@@ -468,9 +476,9 @@ impl Expression {
                     return None
                 });
                 if condtruth {
-                    return if_.is_truthy()
+                    if_.is_truthy()
                 } else {
-                    return else_.is_truthy()
+                    else_.is_truthy()
                 }
             }
         }
@@ -482,9 +490,9 @@ impl From<Term> for Expression {
         match term {
             Term::Expr(expr) => *expr,
             term => Expression::Base {
-                unary: vec![],
-                follow: vec![],
-                term: Spanned::new(Default::default(), term),
+                unary: Default::default(),
+                follow: Default::default(),
+                term: Box::new(Spanned::new(Default::default(), term)),
             },
         }
     }
@@ -501,7 +509,7 @@ pub enum Term {
     /// A floating-point literal.
     Float(f32),
     /// An identifier.
-    Ident(String),
+    Ident(Ident),
     /// A string literal.
     String(String),
     /// A resource literal.
@@ -513,13 +521,13 @@ pub enum Term {
     /// An expression contained in a term.
     Expr(Box<Expression>),
     /// A prefab literal (path + vars).
-    Prefab(Prefab),
+    Prefab(Box<Prefab>),
     /// An interpolated string, alternating string/expr/string/expr.
     InterpString(String, Vec<(Option<Expression>, String)>),
 
     // Function calls with recursive contents ---------------------------------
     /// An unscoped function call.
-    Call(String, Vec<Expression>),
+    Call(Ident, Vec<Expression>),
     /// A `.()` call.
     SelfCall(Vec<Expression>),
     /// A `..()` call. If arguments is empty, the proc's arguments are passed.
@@ -536,7 +544,7 @@ pub enum Term {
     /// An `input` call.
     Input {
         args: Vec<Expression>,
-        input_type: InputType, // as
+        input_type: Option<InputType>, // as
         in_list: Option<Box<Expression>>, // in
     },
     /// A `locate` call.
@@ -552,14 +560,13 @@ pub enum Term {
 
 impl Term {
     pub fn is_static(&self) -> bool {
-        return match self {
-            Term::Null |
-            Term::Int(_) |
-            Term::Float(_) |
-            Term::String(_) |
-            Term::Prefab(_) => true,
-            _ => false,
-        }
+        matches!(self,
+            Term::Null
+            | Term::Int(_)
+            | Term::Float(_)
+            | Term::String(_)
+            | Term::Prefab(_)
+        )
     }
 
     pub fn is_truthy(&self) -> Option<bool> {
@@ -568,7 +575,7 @@ impl Term {
             Term::Null => Some(false),
             Term::Int(i) => Some(*i != 0),
             Term::Float(i) => Some(*i != 0f32),
-            Term::String(s) => Some(s.len() > 0),
+            Term::String(s) => Some(!s.is_empty()),
 
             // Paths/prefabs are truthy.
             Term::Prefab(_) => Some(true),
@@ -593,9 +600,9 @@ impl Term {
         };
     }
 
-    pub fn valid_for_range(&self, other: &Term, step: &Option<Expression>) -> Option<bool> {
-        if let &Term::Int(i) = self {
-            if let &Term::Int(o) = other {
+    pub fn valid_for_range(&self, other: &Term, step: Option<&Expression>) -> Option<bool> {
+        if let Term::Int(i) = *self {
+            if let Term::Int(o) = *other {
                 // edge case
                 if i == 0 && o == 0 {
                     return Some(false)
@@ -632,9 +639,18 @@ impl From<Expression> for Term {
     }
 }
 
+/// The possible kinds of access operators for lists
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum ListAccessKind {
+    /// `[]`
+    Normal,
+    /// `?[]`
+    Safe,
+}
+
 /// The possible kinds of index operators, for both fields and methods.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum IndexKind {
+pub enum PropertyAccessKind {
     /// `a.b`
     Dot,
     /// `a:b`
@@ -645,18 +661,18 @@ pub enum IndexKind {
     SafeColon,
 }
 
-impl IndexKind {
+impl PropertyAccessKind {
     pub fn name(self) -> &'static str {
         match self {
-            IndexKind::Dot => ".",
-            IndexKind::Colon => ":",
-            IndexKind::SafeDot => "?.",
-            IndexKind::SafeColon => "?:",
+            PropertyAccessKind::Dot => ".",
+            PropertyAccessKind::Colon => ":",
+            PropertyAccessKind::SafeDot => "?.",
+            PropertyAccessKind::SafeColon => "?:",
         }
     }
 }
 
-impl fmt::Display for IndexKind {
+impl fmt::Display for PropertyAccessKind {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         fmt.write_str(self.name())
     }
@@ -666,28 +682,23 @@ impl fmt::Display for IndexKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Follow {
     /// Index the value by an expression.
-    Index(Box<Expression>),
+    Index(ListAccessKind, Box<Expression>),
     /// Access a field of the value.
-    Field(IndexKind, String),
+    Field(PropertyAccessKind, Ident),
     /// Call a method of the value.
-    Call(IndexKind, String, Vec<Expression>),
+    Call(PropertyAccessKind, Ident, Vec<Expression>),
 }
 
-/// Like a `Follow` but supports index or fields only.
+/// Like a `Follow` but only supports field accesses.
 #[derive(Debug, Clone, PartialEq)]
-pub enum IndexOrField {
-    /// Index the value by an expression.
-    Index(Box<Expression>),
-    /// Access a field of the value.
-    Field(IndexKind, String),
+pub struct Field {
+    pub kind: PropertyAccessKind,
+    pub ident: Ident,
 }
 
-impl From<IndexOrField> for Follow {
-    fn from(input: IndexOrField) -> Follow {
-        match input {
-            IndexOrField::Index(expr) => Follow::Index(expr),
-            IndexOrField::Field(kind, name) => Follow::Field(kind, name),
-        }
+impl From<Field> for Follow {
+    fn from(field: Field) -> Follow {
+        Follow::Field(field.kind, field.ident)
     }
 }
 
@@ -736,9 +747,9 @@ impl fmt::Display for ProcDeclKind {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Parameter {
     pub var_type: VarType,
-    pub name: String,
+    pub name: Ident,
     pub default: Option<Expression>,
-    pub input_type: InputType,
+    pub input_type: Option<InputType>,
     pub in_list: Option<Expression>,
     pub location: Location,
 }
@@ -746,8 +757,8 @@ pub struct Parameter {
 impl fmt::Display for Parameter {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "{}{}", self.var_type, self.name)?;
-        if !self.input_type.is_empty() {
-            write!(fmt, " as {}", self.input_type)?;
+        if let Some(input_type) = self.input_type {
+            write!(fmt, " as {}", input_type)?;
         }
         Ok(())
     }
@@ -783,7 +794,9 @@ macro_rules! type_table {
                         first = false;
                     }
                 )*
-                let _ = first;
+                if first {
+                    fmt.write_str("()")?;
+                }
                 Ok(())
             }
         }
@@ -792,7 +805,6 @@ macro_rules! type_table {
 
 type_table! {
     /// A type specifier for verb arguments and input() calls.
-    #[derive(Default)]
     pub struct InputType;
 
     // These values can be known with an invocation such as:
@@ -997,7 +1009,7 @@ impl VarSuffix {
             None
         } else {
             Some(Expression::from(Term::New {
-                type_: NewType::Prefab(Prefab::from(vec![(PathOp::Slash, "list".to_owned())])),
+                type_: NewType::Prefab(Box::new(Prefab::from(vec![(PathOp::Slash, "list".to_owned())]))),
                 args: Some(args),
             }))
         }
@@ -1005,7 +1017,7 @@ impl VarSuffix {
 }
 
 /// A block of statements.
-pub type Block = Vec<Spanned<Statement>>;
+pub type Block = Box<[Spanned<Statement>]>;
 
 /// A statement in a proc body.
 #[derive(Debug, Clone, PartialEq)]
@@ -1025,33 +1037,36 @@ pub enum Statement {
         arms: Vec<(Spanned<Expression>, Block)>,
         else_arm: Option<Block>
     },
+    ForInfinite {
+        block: Block,
+    },
     ForLoop {
         init: Option<Box<Statement>>,
-        test: Option<Expression>,
+        test: Option<Box<Expression>>,
         inc: Option<Box<Statement>>,
         block: Block,
     },
     ForList {
         var_type: Option<VarType>,
-        name: String,
+        name: Ident,
         /// If zero, uses the declared type of the variable.
-        input_type: InputType,
+        input_type: Option<InputType>,
         /// Defaults to 'world'.
-        in_list: Option<Expression>,
+        in_list: Option<Box<Expression>>,
         block: Block,
     },
     ForRange {
         var_type: Option<VarType>,
-        name: String,
-        start: Expression,
-        end: Expression,
-        step: Option<Expression>,
+        name: Ident,
+        start: Box<Expression>,
+        end: Box<Expression>,
+        step: Option<Box<Expression>>,
         block: Block,
     },
-    Var(VarStatement),
+    Var(Box<VarStatement>),
     Vars(Vec<VarStatement>),
     Setting {
-        name: String,
+        name: Ident,
         mode: SettingMode,
         value: Expression
     },
@@ -1060,8 +1075,8 @@ pub enum Statement {
         block: Block,
     },
     Switch {
-        input: Expression,
-        cases: Vec<(Spanned<Vec<Case>>, Block)>,
+        input: Box<Expression>,
+        cases: Box<[(Spanned<Vec<Case>>, Block)]>,
         default: Option<Block>,
     },
     TryCatch {
@@ -1069,21 +1084,21 @@ pub enum Statement {
         catch_params: Vec<TreePath>,
         catch_block: Block,
     },
-    Continue(Option<String>),
-    Break(Option<String>),
-    Goto(String),
+    Continue(Option<Ident>),
+    Break(Option<Ident>),
+    Goto(Ident),
     Label {
-        name: String,
+        name: Ident,
         block: Block,
     },
     Del(Expression),
-    Crash(Expression),
+    Crash(Option<Expression>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct VarStatement {
     pub var_type: VarType,
-    pub name: String,
+    pub name: Ident,
     pub value: Option<Expression>,
 }
 
@@ -1134,6 +1149,7 @@ pub const KNOWN_SETTING_NAMES: &[&str] = &[
 pub static VALID_FILTER_TYPES: phf::Map<&'static str, &[&str]> = phf_map! {
     "alpha" => &[ "x", "y", "icon", "render_source", "flags" ],
     "angular_blur" => &[ "x", "y", "size" ],
+    "bloom" => &[ "threshold", "size", "offset", "alpha" ],
     "color" => &[ "color", "space" ],
     "displace" => &[ "x", "y", "size", "icon", "render_source" ],
     "drop_shadow" => &[ "x", "y", "size", "offset", "color"],
@@ -1151,8 +1167,8 @@ pub static VALID_FILTER_TYPES: phf::Map<&'static str, &[&str]> = phf_map! {
 pub static VALID_FILTER_FLAGS: phf::Map<&'static str, (&str, bool, bool, &[&str])> = phf_map! {
     "alpha" => ("flags", false, true, &[ "MASK_INVERSE", "MASK_SWAP" ]),
     "color" => ("space", true, false, &[ "FILTER_COLOR_RGB", "FILTER_COLOR_HSV", "FILTER_COLOR_HSL", "FILTER_COLOR_HCY" ]),
-    "layer" => ("flags", true, true, &[ "FLAG_OVERLAY", "FLAG_UNDERLAY" ]),
-    "rays" => ("flags", false, true, &[ "FLAG_OVERLAY", "FLAG_UNDERLAY" ]),
+    "layer" => ("flags", true, true, &[ "FILTER_OVERLAY", "FILTER_UNDERLAY" ]),
+    "rays" => ("flags", false, true, &[ "FILTER_OVERLAY", "FILTER_UNDERLAY" ]),
     "outline" => ("flags", false, true, &[ "OUTLINE_SHARP", "OUTLINE_SQUARE" ]),
     "ripple" => ("flags", false, true, &[ "WAVE_BOUNDED" ]),
     "wave" => ("flags", false, true, &[ "WAVE_SIDEWAYS", "WAVE_BOUNDED" ]),

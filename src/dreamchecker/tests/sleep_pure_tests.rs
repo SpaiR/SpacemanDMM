@@ -45,6 +45,110 @@ fn sleep() {
     check_errors_match(code, SLEEP_ERRORS);
 }
 
+pub const SLEEP_ERRORS2: &[(u32, u16, &str)] = &[
+    (8, 21, "/mob/living/proc/bar calls /mob/living/proc/foo which has override child proc that sleeps /mob/living/carbon/proc/foo"),
+];
+
+#[test]
+fn sleep2() {
+    let code = r##"
+/mob/New()
+/mob/proc/foo()
+    sleep(1)
+/mob/living/foo()
+    return TRUE
+/mob/living/carbon/foo()
+    sleep(1)
+/mob/living/proc/bar()
+    set SpacemanDMM_should_not_sleep = TRUE
+    foo()
+    thing()
+    new /mob/living()
+/mob/living/New()
+    . = ..()
+/mob/living/carbon/human/foo()
+    . = ..()
+/mob/dead/New()
+    sleep(1)
+/mob/proc/thing()
+/mob/dead/thing()
+    sleep(1)
+/mob/living/thing()
+    . = ..()
+"##.trim();
+    check_errors_match(code, SLEEP_ERRORS2);
+}
+
+// This test is like sleep2, but checks /atom/movable -> /mob relationship
+#[test]
+fn sleep3() {
+    let code = r##"
+/atom/New()
+/atom/proc/foo()
+    sleep(1)
+/atom/movable/foo()
+    return TRUE
+/mob/foo()
+    sleep(1)
+/atom/movable/proc/bar()
+    set SpacemanDMM_should_not_sleep = TRUE
+    foo()
+    thing()
+    new /atom/movable()
+/atom/movable/New()
+    . = ..()
+/mob/human/foo()
+    . = ..()
+/atom/dead/New()
+    sleep(1)
+/atom/proc/thing()
+/atom/dead/thing()
+    sleep(1)
+/atom/movable/thing()
+    . = ..()
+"##.trim();
+    check_errors_match(code, &[
+        (8, 23, "/atom/movable/proc/bar calls /atom/movable/proc/foo which has override child proc that sleeps /mob/proc/foo"),
+    ]);
+}
+
+pub const SLEEP_ERROR4: &[(u32, u16, &str)] = &[
+    (1, 16, "/mob/proc/test1 sets SpacemanDMM_should_not_sleep but calls blocking built-in(s)"),
+    (1, 16, "/mob/proc/test1 sets SpacemanDMM_should_not_sleep but calls blocking proc /mob/proc/test2"),
+    (1, 16, "/mob/proc/test1 sets SpacemanDMM_should_not_sleep but calls blocking proc /client/proc/checksoundquery"),
+    (1, 16, "/mob/proc/test1 sets SpacemanDMM_should_not_sleep but calls blocking proc /client/proc/checkmeasuretext"),
+    (1, 16, "/mob/proc/test1 sets SpacemanDMM_should_not_sleep but calls blocking proc /world/proc/checkimport"),
+    (1, 16, "/mob/proc/test1 sets SpacemanDMM_should_not_sleep but calls blocking proc /world/proc/checkexport"),
+];
+
+#[test]
+fn sleep4() {
+    let code = r##"
+/mob/proc/test1()
+    set SpacemanDMM_should_not_sleep = TRUE
+    world.Export()
+    world.Import()
+    var/client/C = new /client
+    test2()
+    C.checksoundquery()
+    C.checkmeasuretext()
+    world.checkimport()
+    world.checkexport()
+/client/proc/checksoundquery()
+    SoundQuery()
+/client/proc/checkmeasuretext()
+    MeasureText()
+/world/proc/checkimport()
+    Import()
+/world/proc/checkexport()
+    Export()
+/mob/proc/test2()
+    var/client/C = new /client
+    C.MeasureText()
+"##.trim();
+    check_errors_match(code, SLEEP_ERROR4);
+}
+
 pub const PURE_ERRORS: &[(u32, u16, &str)] = &[
     (12, 16, "/mob/proc/test2 sets SpacemanDMM_should_be_pure but calls a /proc/impure that does impure operations"),
 ];

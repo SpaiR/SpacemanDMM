@@ -22,6 +22,9 @@ pub use self::smart_cables::SmartCables;
 /// appear here.
 #[allow(unused_variables)]
 pub trait RenderPass: Sync {
+    /// Configure pass from the map renderer config.
+    fn configure(&mut self, renderer_config: &dm::config::MapRenderer) {}
+
     /// Filter atoms based solely on their typepath.
     fn path_filter(&self,
         path: &str,
@@ -112,9 +115,10 @@ pub const RENDER_PASSES: &[RenderPassInfo] = &[
     pass!(IconSmoothing2016, "icon-smoothing-2016", "Emulate the icon smoothing subsystem (xxalpha, 2016).", false),
     pass!(IconSmoothing, "icon-smoothing", "Emulate the icon smoothing subsystem (Rohesie, 2020).", true),
     pass!(SmartCables, "smart-cables", "Handle smart cable layout.", true),
+    pass!(WiresAndPipes, "only-wires-and-pipes", "Renders only power cables and atmospheric pipes.", false),
 ];
 
-pub fn configure(include: &str, exclude: &str) -> Vec<Box<dyn RenderPass>> {
+pub fn configure(renderer_config: &dm::config::MapRenderer, include: &str, exclude: &str) -> Vec<Box<dyn RenderPass>> {
     let include: Vec<&str> = include.split(",").collect();
     let exclude: Vec<&str> = exclude.split(",").collect();
     let include_all = include.iter().any(|&name| name == "all");
@@ -130,11 +134,15 @@ pub fn configure(include: &str, exclude: &str) -> Vec<Box<dyn RenderPass>> {
             true
         } else if exclude_all {
             false
+        } else if let Some(&value) = renderer_config.render_passes.get(pass.name) {
+            value
         } else {
             pass.default
         };
         if included {
-            output.push((pass.new)());
+            let mut obj = (pass.new)();
+            obj.configure(renderer_config);
+            output.push(obj);
         }
     }
     output
@@ -181,13 +189,36 @@ impl RenderPass for HideAreas {
 }
 
 #[derive(Default)]
-pub struct HideInvisible;
+pub struct HideInvisible {
+    overrides: Vec<String>,
+}
+
 impl RenderPass for HideInvisible {
+    fn configure(&mut self, renderer_config: &dm::config::MapRenderer) {
+        self.overrides = renderer_config.hide_invisible.clone();
+        // Put longer typepaths earlier in the list so that `/foo/bar` can override `/foo`.
+        self.overrides.sort_unstable_by_key(|k| usize::MAX - k.len());
+        // Append `/` to each typepath for faster starts_with later.
+        for key in self.overrides.iter_mut() {
+            if !key.ends_with('/') {
+                key.push('/');
+            }
+        }
+    }
+
     fn path_filter(&self, path: &str) -> bool {
         !subpath(path, "/obj/effect/spawner/xmastree/")
     }
 
     fn early_filter(&self, atom: &Atom, objtree: &ObjectTree) -> bool {
+        // Remove it if it is in our list of atoms to hide
+        for pathtype in self.overrides.iter() {
+            // Note: You *cannot* just `return !atom.istype(pathtype)`
+            // If you do that, you skip the rest of the loop iterations
+            if atom.istype(pathtype) {
+                return false;
+            }
+        }
         // invisible objects and syndicate balloons are not to show
         if atom.get_var("invisibility", objtree).to_float().unwrap_or(0.) > 60. ||
             atom.istype("/obj/effect/mapping_helpers/")
@@ -306,7 +337,7 @@ impl RenderPass for Overlays {
             let mut terminal = Sprite::from_vars(objtree, &objtree.expect("/obj/machinery/power/terminal"));
             terminal.dir = atom.sprite.dir;
             // TODO: un-hack this
-            apply_fancy_layer("/obj/machinery/power/terminal", &mut terminal);
+            FancyLayers::default().apply_fancy_layer("/obj/machinery/power/terminal", &mut terminal);
             underlays.push(terminal);
         }
     }
@@ -385,15 +416,38 @@ impl RenderPass for Pipes {
 }
 
 #[derive(Default)]
-pub struct FancyLayers;
+pub struct WiresAndPipes;
+impl RenderPass for WiresAndPipes {
+    fn late_filter(&self, atom: &Atom, _: &ObjectTree) -> bool {
+        atom.istype("/obj/machinery/atmospherics/pipe/") || atom.istype("/obj/structure/cable/")
+    }
+}
+
+#[derive(Default)]
+pub struct FancyLayers {
+    overrides: Vec<(String, f32)>,
+}
+
 impl RenderPass for FancyLayers {
+    fn configure(&mut self, renderer_config: &dm::config::MapRenderer) {
+        self.overrides = renderer_config.fancy_layers.clone().into_iter().collect::<Vec<_>>();
+        // Put longer typepaths earlier in the list so that `/foo/bar` can override `/foo`.
+        self.overrides.sort_unstable_by_key(|(k, _)| usize::MAX - k.len());
+        // Append `/` to each typepath for faster starts_with later.
+        for (key, _) in self.overrides.iter_mut() {
+            if !key.ends_with('/') {
+                key.push('/');
+            }
+        }
+    }
+
     fn adjust_sprite<'a>(&self,
         atom: &Atom<'a>,
         sprite: &mut Sprite<'a>,
         objtree: &'a ObjectTree,
         _: &'a bumpalo::Bump,
     ) {
-        apply_fancy_layer(atom.get_path(), sprite);
+        self.apply_fancy_layer(atom.get_path(), sprite);
 
         // dual layering of vents 1: hide original sprite underfloor
         if atom.istype("/obj/machinery/atmospherics/components/unary/") {
@@ -438,37 +492,45 @@ fn unary_aboveground(atom: &Atom, objtree: &ObjectTree) -> Option<&'static str> 
     })
 }
 
-fn fancy_layer_for_path(p: &str) -> Option<Layer> {
-    Some(if subpath(p, "/turf/open/floor/plating/") || subpath(p, "/turf/open/space/") {
-        Layer::from(-10)  // under everything
-    } else if subpath(p, "/turf/closed/mineral/") {
-        Layer::from(-3)   // above hidden stuff and plating but below walls
-    } else if subpath(p, "/turf/open/floor/") || subpath(p, "/turf/closed/") {
-        Layer::from(-2)   // above hidden pipes and wires
-    } else if subpath(p, "/turf/") {
-        Layer::from(-10)  // under everything
-    } else if subpath(p, "/obj/effect/turf_decal/") {
-        Layer::from(-1)   // above turfs
-    } else if subpath(p, "/obj/structure/disposalpipe/") {
-        Layer::from(-6)
-    } else if subpath(p, "/obj/machinery/atmospherics/pipe/") && !p.contains("visible") {
-        Layer::from(-5)
-    } else if subpath(p, "/obj/structure/cable/") {
-        Layer::from(-4)
-    } else if subpath(p, "/obj/machinery/power/terminal/") {
-        Layer::from(-3.5)
-    } else if subpath(p, "/obj/structure/lattice/") {
-        Layer::from(-8)
-    } else if subpath(p, "/obj/machinery/navbeacon/") {
-        Layer::from(-3)
-    } else {
-        return None
-    })
-}
+impl FancyLayers {
+    fn fancy_layer_for_path(&self, p: &str) -> Option<Layer> {
+        for &(ref key, val) in self.overrides.iter() {
+            if subpath(p, key) {
+                return Some(Layer::from(val));
+            }
+        }
 
-fn apply_fancy_layer(path: &str, sprite: &mut Sprite) {
-    sprite.plane = 0;
-    if let Some(layer) = fancy_layer_for_path(path) {
-        sprite.layer = layer;
+        if subpath(p, "/turf/open/floor/plating/") || subpath(p, "/turf/open/space/") {
+            Some(Layer::from(-10))  // under everything
+        } else if subpath(p, "/turf/closed/mineral/") {
+            Some(Layer::from(-3))   // above hidden stuff and plating but below walls
+        } else if subpath(p, "/turf/open/floor/") || subpath(p, "/turf/closed/") {
+            Some(Layer::from(-2))   // above hidden pipes and wires
+        } else if subpath(p, "/turf/") {
+            Some(Layer::from(-10))  // under everything
+        } else if subpath(p, "/obj/effect/turf_decal/") {
+            Some(Layer::from(-1))   // above turfs
+        } else if subpath(p, "/obj/structure/disposalpipe/") {
+            Some(Layer::from(-6))
+        } else if subpath(p, "/obj/machinery/atmospherics/pipe/") && !p.contains("visible") {
+            Some(Layer::from(-5))
+        } else if subpath(p, "/obj/structure/cable/") {
+            Some(Layer::from(-4))
+        } else if subpath(p, "/obj/machinery/power/terminal/") {
+            Some(Layer::from(-3.5))
+        } else if subpath(p, "/obj/structure/lattice/") {
+            Some(Layer::from(-8))
+        } else if subpath(p, "/obj/machinery/navbeacon/") {
+            Some(Layer::from(-3))
+        } else {
+            None
+        }
+    }
+
+    fn apply_fancy_layer(&self, path: &str, sprite: &mut Sprite) {
+        sprite.plane = 0;
+        if let Some(layer) = self.fancy_layer_for_path(path) {
+            sprite.layer = layer;
+        }
     }
 }

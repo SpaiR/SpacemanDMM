@@ -145,7 +145,6 @@ pub struct Extools {
     runtime_rx: mpsc::Receiver<Runtime>,
     get_list_contents_rx: mpsc::Receiver<ListContents>,
     get_source_rx: mpsc::Receiver<GetSource>,
-    step_rx: mpsc::Receiver<ProcOffset>,
     last_runtime: Option<Runtime>,
 }
 
@@ -166,7 +165,6 @@ impl Extools {
         let (runtime_tx, runtime_rx) = mpsc::channel();
         let (get_list_contents_tx, get_list_contents_rx) = mpsc::channel();
         let (get_source_tx, get_source_rx) = mpsc::channel();
-        let (step_tx, step_rx) = mpsc::sync_channel(0);
 
         let extools = Extools {
             seq,
@@ -179,7 +177,6 @@ impl Extools {
             runtime_rx,
             get_list_contents_rx,
             get_source_rx,
-            step_rx,
             last_runtime: None,
         };
         let seq = extools.seq.clone();
@@ -195,18 +192,27 @@ impl Extools {
             runtime_tx,
             get_list_contents_tx,
             get_source_tx,
-            step_tx,
         };
         (extools, thread)
     }
 
-    pub fn get_default_thread(&self) -> Result<ThreadInfo, Box<dyn Error>> {
-        self.get_thread(0)
+    pub fn get_all_threads(&self) -> std::sync::MutexGuard<HashMap<i64, ThreadInfo>> {
+        self.threads.lock().unwrap()
     }
 
     pub fn get_thread(&self, thread_id: i64) -> Result<ThreadInfo, Box<dyn Error>> {
         self.threads.lock().unwrap().get(&thread_id).cloned()
             .ok_or_else(|| Box::new(super::GenericError("Getting call stack failed")) as Box<dyn Error>)
+    }
+
+    pub fn get_thread_by_frame_id(&self, frame_id: i64) -> Result<(ThreadInfo, usize), Box<dyn Error>> {
+        let frame_id = frame_id as usize;
+        let threads = self.threads.lock().unwrap();
+        let thread_id = (frame_id % threads.len()) as i64;
+        let frame_no = frame_id / threads.len();
+        let thread = threads.get(&thread_id).cloned()
+            .ok_or_else(|| Box::new(super::GenericError("Getting call stack failed")) as Box<dyn Error>)?;
+        Ok((thread, frame_no))
     }
 
     pub fn bytecode(&mut self, proc_ref: &str, override_id: usize) -> &[DisassembledInstruction] {
@@ -265,55 +271,8 @@ impl Extools {
         self.sender.send(BreakpointResume);
     }
 
-    fn step_until_line<T: Request + Clone>(&mut self, thread_id: i64, msg: T) {
-        let frame = {
-            let lock = self.threads.lock().unwrap();
-            guard!(let Some(thread) = lock.get(&thread_id) else {
-                debug_output!(in self.seq, "[extools] Line-step bad thread ID");
-                self.sender.send(msg);
-                return;
-            });
-            guard!(let Some(frame) = thread.call_stack.get(0) else {
-                debug_output!(in self.seq, "[extools] Line-step bad stack frame");
-                self.sender.send(msg);
-                return;
-            });
-            ProcOffset {
-                proc: frame.proc.clone(),
-                override_id: frame.override_id,
-                offset: frame.offset,
-            }
-        };
-        let frame_line = self.offset_to_line(&frame.proc, frame.override_id, frame.offset);
-
-        self.sender.send(msg.clone());
-        let mut got_stopped = false;
-        while let Ok(hit) = self.step_rx.recv_timeout(RECV_TIMEOUT) {
-            // Always keep stepping if current proc is stddef.
-            if !super::STDDEF_PROCS.contains(&hit.proc.as_str()) || hit.override_id != 0 {
-                // Break if current proc changed
-                if hit.proc != frame.proc && hit.override_id != frame.override_id {
-                    got_stopped = true;
-                    break;
-                }
-                // Break if line number changed
-                let line = self.offset_to_line(&hit.proc, hit.override_id, hit.offset);
-                if line != frame_line {
-                    got_stopped = true;
-                    break;
-                }
-            }
-            // Keep stepping
-            self.sender.send(msg.clone());
-        }
-
-        if got_stopped {
-            self.seq.issue_event(dap_types::StoppedEvent {
-                reason: dap_types::StoppedEvent::REASON_STEP.to_owned(),
-                threadId: Some(0),
-                .. Default::default()
-            });
-        }
+    fn step_until_line<T: Request + Clone>(&mut self, _thread_id: i64, msg: T) {
+        self.sender.send(msg);
     }
 
     pub fn step_in(&mut self, thread_id: i64) {
@@ -322,6 +281,10 @@ impl Extools {
 
     pub fn step_over(&mut self, thread_id: i64) {
         self.step_until_line(thread_id, BreakpointStepOver);
+    }
+
+    pub fn step_out(&mut self, thread_id: i64) {
+        self.step_until_line(thread_id, BreakpointStepOut);
     }
 
     pub fn pause(&self) {
@@ -391,7 +354,6 @@ struct ExtoolsThread {
     runtime_tx: mpsc::Sender<Runtime>,
     get_list_contents_tx: mpsc::Sender<ListContents>,
     get_source_tx: mpsc::Sender<GetSource>,
-    step_tx: mpsc::SyncSender<ProcOffset>,
 }
 
 impl ExtoolsThread {
@@ -450,6 +412,23 @@ impl ExtoolsThread {
             debug_output!(in self.seq, "[extools] Dropping {:?}", _e);
         }
     }
+
+    fn stopped(&self, base: dap_types::StoppedEvent) {
+        for &k in self.threads.lock().unwrap().keys() {
+            if k != 0 {
+                self.seq.issue_event(dap_types::StoppedEvent {
+                    reason: "sleep".to_owned(),
+                    threadId: Some(k),
+                    preserveFocusHint: Some(true),
+                    .. Default::default()
+                });
+            }
+        }
+        self.seq.issue_event(dap_types::StoppedEvent {
+            threadId: Some(0),
+            .. base
+        });
+    }
 }
 
 handle_extools! {
@@ -468,26 +447,22 @@ handle_extools! {
     on BreakpointHit(&mut self, hit) {
         match hit.reason {
             BreakpointHitReason::Step => {
-                // Try to transmit the step event to step_until_line above if
-                // it's listening, but if it timed out without issuing a
-                // Stopped, do that now.
-                if self.step_tx.try_send(ProcOffset {
-                    proc: hit.proc,
-                    override_id: hit.override_id,
-                    offset: hit.offset,
-                }).is_err() {
-                    self.seq.issue_event(dap_types::StoppedEvent {
-                        reason: dap_types::StoppedEvent::REASON_STEP.to_owned(),
-                        threadId: Some(0),
-                        .. Default::default()
-                    });
-                }
+                self.stopped(dap_types::StoppedEvent {
+                    reason: dap_types::StoppedEvent::REASON_STEP.to_owned(),
+                    .. Default::default()
+                });
+            }
+            BreakpointHitReason::Pause => {
+                self.stopped(dap_types::StoppedEvent {
+                    reason: dap_types::StoppedEvent::REASON_PAUSE.to_owned(),
+                    description: Some("Paused by request".to_owned()),
+                    .. Default::default()
+                })
             }
             _ => {
                 debug_output!(in self.seq, "[extools] {}#{}@{} hit", hit.proc, hit.override_id, hit.offset);
-                self.seq.issue_event(dap_types::StoppedEvent {
+                self.stopped(dap_types::StoppedEvent {
                     reason: dap_types::StoppedEvent::REASON_BREAKPOINT.to_owned(),
-                    threadId: Some(0),
                     .. Default::default()
                 });
             }
@@ -496,10 +471,9 @@ handle_extools! {
 
     on Runtime(&mut self, runtime) {
         output!(in self.seq, "[extools] Runtime in {}: {}", runtime.proc, runtime.message);
-        self.seq.issue_event(dap_types::StoppedEvent {
+        self.stopped(dap_types::StoppedEvent {
             reason: dap_types::StoppedEvent::REASON_EXCEPTION.to_owned(),
             text: Some(runtime.message.clone()),
-            threadId: Some(0),
             .. Default::default()
         });
         self.queue(&self.runtime_tx, runtime);
@@ -507,7 +481,11 @@ handle_extools! {
 
     on CallStack(&mut self, stack) {
         let mut map = self.threads.lock().unwrap();
-        map.entry(0).or_default().call_stack = stack.0;
+        map.clear();
+        map.entry(0).or_default().call_stack = stack.current;
+        for (i, list) in stack.suspended.into_iter().enumerate() {
+            map.entry((i + 1) as i64).or_default().call_stack = list;
+        }
     }
 
     on DisassembledProc(&mut self, disasm) {

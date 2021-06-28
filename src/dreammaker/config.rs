@@ -24,6 +24,8 @@ pub struct Config {
     // tool-specific configuration
     pub langserver: Langserver,
     pub dmdoc: DMDoc,
+    pub debugger: Debugger,
+    pub map_renderer: MapRenderer,
 }
 
 /// General error display options
@@ -49,8 +51,18 @@ pub struct CodeStandards {
 
 /// DMDoc config options
 #[derive(Deserialize, Default, Debug, Clone)]
+#[serde(default)]
 pub struct DMDoc {
     pub use_typepath_names: bool,
+    pub index_file: Option<String>,
+    pub module_directories: Vec<String>,
+}
+
+// Debugger config options
+#[derive(Deserialize, Default, Debug, Clone)]
+pub struct Debugger {
+    #[serde(default)]
+    pub engine: DebugEngine,
 }
 
 /// Severity overrides from configuration
@@ -68,6 +80,31 @@ pub enum WarningLevel {
     #[serde(alias = "false", alias = "off")]
     Disabled = 5,
     Unset = 6,
+}
+
+/// Available debug engines.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq)]
+pub enum DebugEngine {
+    #[serde(alias = "extools")]
+    Extools,
+    #[serde(alias = "auxtools")]
+    Auxtools,
+}
+
+/// Config for the map renderer.
+#[derive(Debug, Default, Deserialize, Clone)]
+#[serde(default)]
+pub struct MapRenderer {
+    /// Map from render pass name to whether it should be enabled/disabled.
+    ///
+    /// Priority is: CLI arguments > config > defaults.
+    pub render_passes: HashMap<String, bool>,
+
+    /// Map from typepath to layer number.
+    pub fancy_layers: HashMap<String, f32>,
+
+    /// List of typepath to just hide
+    pub hide_invisible: Vec<String>,
 }
 
 impl Config {
@@ -149,6 +186,12 @@ impl PartialEq<Severity> for WarningLevel {
             (WarningLevel::Hint, Severity::Hint) => true,
             _ => false,
         }
+    }
+}
+
+impl Default for DebugEngine {
+    fn default() -> Self {
+        Self::Extools
     }
 }
 

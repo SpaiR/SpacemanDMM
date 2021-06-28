@@ -13,8 +13,6 @@ use super::annotation::*;
 use super::ast::*;
 use super::docs::*;
 
-type Ident = String;
-
 // ----------------------------------------------------------------------------
 // Error handling
 
@@ -142,7 +140,7 @@ macro_rules! oper_table {
 // Highest precedence is first in the list, to match the reference.
 oper_table! { BINARY_OPS;
     // () . : /        // here . : / are path operators
-    // []
+    // [] ?[]
     // . : ?. :
     // ~ ! - ++ --     // unary operators
     // **
@@ -217,6 +215,9 @@ oper_table! { BINARY_OPS;
         (AssignOp, BitXorAssign),
         (AssignOp, LShiftAssign),
         (AssignOp, RShiftAssign),
+        (AssignOp, AssignInto),
+        (AssignOp, AndAssign),
+        (AssignOp, OrAssign),
     }
     // "in" is special and has different precedence in different contexts
     In {
@@ -227,10 +228,7 @@ oper_table! { BINARY_OPS;
 
 impl Strength {
     fn right_binding(self) -> bool {
-        match self {
-            Strength::Assign => true,
-            _ => false,
-        }
+        matches!(self, Strength::Assign)
     }
 }
 
@@ -270,6 +268,7 @@ impl TTKind {
 #[derive(Debug)]
 enum LoopContext {
     None,
+    ForInfinite,
     ForLoop,
     ForList,
     ForRange,
@@ -367,7 +366,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
     pub fn parse_with_module_docs(mut self) -> (ObjectTree, BTreeMap<FileId, Vec<(u32, DocComment)>>) {
         self.tree.register_builtins();
         self.run();
-        let docs = std::mem::replace(&mut self.module_docs, Default::default());
+        let docs = std::mem::take(&mut self.module_docs);
         (self.finalize_object_tree(), docs)
     }
 
@@ -568,8 +567,8 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
     fn doc_comment<R, F: FnOnce(&mut Self) -> Status<R>>(&mut self, f: F) -> Status<(DocCollection, R)> {
         use std::mem::replace;
 
-        let enclosing = replace(&mut self.docs_enclosing, Default::default());
-        let mut docs = replace(&mut self.docs_following, Default::default());
+        let enclosing = std::mem::take(&mut self.docs_enclosing);
+        let mut docs = std::mem::take(&mut self.docs_following);
         self.in_docs += 1;
         let result = f(self);
         self.in_docs -= 1;
@@ -725,6 +724,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             }
         };
 
+        let mut relative_type_location = None;
         macro_rules! traverse_tree {
             ($what:expr) => {
                 let each = $what;
@@ -744,6 +744,19 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 } else {
                     let len = self.tree[current].path.chars().filter(|&c| c == '/').count() + path_len;
                     current = self.tree.subtype_or_add(self.location, current, each, len);
+
+                    if !absolute && self.context.config().code_standards.disallow_relative_type_definitions {
+                        relative_type_location = Some(self.location);
+                    }
+                }
+            }
+        }
+        macro_rules! handle_relative_type_error {
+            () => {
+                if let Some(loc) = relative_type_location {
+                    DMError::new(loc, "relatively pathed type defined here")
+                        .set_severity(Severity::Warning)
+                        .register(self.context);
                 }
             }
         }
@@ -769,6 +782,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 // `thing{` - block
                 self.put_back(t);
                 traverse_tree!(last_part);
+                handle_relative_type_error!();
                 let start = self.updated_location();
 
                 if proc_kind.is_some() || var_type.is_some() {
@@ -785,6 +799,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             }
             Punct(Assign) => {
                 // `something=` - var
+                handle_relative_type_error!();
                 let location = self.location;
 
                 // kind of goofy, but allows "enclosing" doc comments at the end of the line
@@ -846,6 +861,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                     self.error("child of `proc/` without body")
                         .register(self.context);
                 } else {
+                    handle_relative_type_error!();
                     let docs = std::mem::take(&mut self.docs_following);
                     let len = self.tree[current].path.chars().filter(|&c| c == '/').count() + path_len;
                     current = self.tree.subtype_or_add(self.location, current, last_part, len);
@@ -1096,12 +1112,12 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
     }
 
     /// Parse an optional 'as' input_type and 'in' expression pair.
-    fn input_specifier(&mut self) -> Status<(InputType, Option<Expression>)> {
+    fn input_specifier(&mut self) -> Status<(Option<InputType>, Option<Expression>)> {
         // as obj|turf
         let input_type = if let Some(()) = self.exact_ident("as")? {
-            require!(self.input_type())
+            Some(require!(self.input_type()))
         } else {
-            InputType::default()
+            None
         };
         // `in view(7)` or `in list("a", "b")` or ...
         let in_list;
@@ -1123,12 +1139,18 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
 
     /// Parse a verb input type. Used by proc params and the input() form.
     fn input_type(&mut self) -> Status<InputType> {
+        // Not supporting `as((mob|obj)|turf)` constructs right now.
+        if self.exact(Token::Punct(Punctuation::LParen))?.is_some() {
+            require!(self.exact(Token::Punct(Punctuation::RParen)));
+            return success(InputType::empty());
+        }
+
         let ident = leading!(self.ident());
         let mut as_what = match InputType::from_str(&ident) {
             Some(what) => what,
             None => {
                 self.context.register_error(self.error(format!("bad input type: '{}'", ident)));
-                InputType::default()
+                InputType::empty()
             }
         };
         while let Some(()) = self.exact(Token::Punct(Punctuation::BitOr))? {
@@ -1169,10 +1191,10 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
         for (loc, var_type, name) in vars {
             self.annotate(loc, || Annotation::LocalVarScope(var_type, name));
         }
-        success(result)
+        success(result.into_boxed_slice())
     }
 
-    fn statement(&mut self, loop_ctx: &LoopContext, vars: &mut Vec<(Location, VarType, String)>) -> Status<Spanned<Statement>> {
+    fn statement(&mut self, loop_ctx: &LoopContext, vars: &mut Vec<(Location, VarType, Ident)>) -> Status<Spanned<Statement>> {
         let start = self.location();
         let spanned = |v| success(Spanned::new(start, v));
 
@@ -1220,6 +1242,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             require!(self.statement_terminator());
             spanned(Statement::DoWhile { block, condition })
         } else if let Some(()) = self.exact_ident("for")? {
+            // for ()
             // for (Var [as Type] [in List]) Statement
             // for (Init, Test, Inc) Statement
             // for (Var in Low to High)
@@ -1236,7 +1259,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 require!(self.exact(Token::Punct(Punctuation::RParen)));
                 spanned(Statement::ForLoop {
                     init: init.map(Box::new),
-                    test,
+                    test: test.map(Box::new),
                     inc: inc.map(Box::new),
                     block: require!(self.block(&LoopContext::ForLoop)),
                 })
@@ -1244,16 +1267,15 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 // in-list form ("for list")
                 let (var_type, name) = match init {
                     // this is a really terrible way to do this
-                    Statement::Var(VarStatement {
-                        var_type,
-                        name,
-                        value: Some(value),
-                    }) => {
-                        // for(var/a = 1 to
-                        require!(self.exact_ident("to"));
-                        let rhs = require!(self.expression());
-                        return spanned(require!(self.for_range(Some(var_type), name, value, rhs)));
-                    }
+                    Statement::Var(vs) => match vs.value {
+                        None => (Some(vs.var_type), vs.name),
+                        Some(value) => {
+                            // for(var/a = 1 to
+                            require!(self.exact_ident("to"));
+                            let rhs = require!(self.expression());
+                            return spanned(require!(self.for_range(Some(vs.var_type), vs.name, Box::new(value), Box::new(rhs))));
+                        }
+                    },
                     Statement::Expr(Expression::AssignOp {
                         op: AssignOp::Assign,
                         lhs,
@@ -1266,13 +1288,8 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                         };
                         require!(self.exact_ident("to"));
                         let to_rhs = require!(self.expression());
-                        return spanned(require!(self.for_range(None, name, *rhs, to_rhs)));
+                        return spanned(require!(self.for_range(None, name, rhs, Box::new(to_rhs))));
                     }
-                    Statement::Var(VarStatement {
-                        var_type,
-                        name,
-                        value: None,
-                    }) => (Some(var_type), name),
                     Statement::Expr(Expression::BinaryOp {
                         op: BinaryOp::In,
                         lhs,
@@ -1289,7 +1306,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                         //   let (b, c) = *a;
                         match {*rhs} {
                             Expression::BinaryOp { op: BinaryOp::To, lhs, rhs } => {
-                                return spanned(require!(self.for_range(None, name, *lhs, *rhs)));
+                                return spanned(require!(self.for_range(None, name, lhs, rhs)));
                             },
                             rhs => {
                                 // I love code duplication, don't you?
@@ -1297,8 +1314,8 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                                 return spanned(Statement::ForList {
                                     var_type: None,
                                     name,
-                                    input_type: InputType::default(),
-                                    in_list: Some(rhs),
+                                    input_type: None,
+                                    in_list: Some(Box::new(rhs)),
                                     block: require!(self.block(&LoopContext::ForList)),
                                 });
                             }
@@ -1313,16 +1330,16 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
 
                 let input_type = if let Some(()) = self.exact_ident("as")? {
                     // for(var/a as obj
-                    require!(self.input_type())
+                    Some(require!(self.input_type()))
                 } else {
-                    InputType::default()
+                    None
                 };
 
                 let in_list = if let Some(()) = self.exact(Token::Punct(Punctuation::In))? {
                     let value = require!(self.expression());
                     if let Some(()) = self.exact_ident("to")? {
                         let rhs = require!(self.expression());
-                        return spanned(require!(self.for_range(var_type, name, value, rhs)));
+                        return spanned(require!(self.for_range(var_type, name, Box::new(value), Box::new(rhs))));
                     }
                     Some(value)
                 } else {
@@ -1334,11 +1351,14 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                     var_type,
                     name,
                     input_type,
-                    in_list,
+                    in_list: in_list.map(Box::new),
                     block: require!(self.block(&LoopContext::ForList)),
                 })
             } else {
-                Err(self.error("for-in-list must start with variable"))
+                require!(self.exact(Token::Punct(Punctuation::RParen)));
+                spanned(Statement::ForInfinite {
+                    block: require!(self.block(&LoopContext::ForInfinite)),
+                })
             }
         } else if let Some(()) = self.exact_ident("spawn")? {
             let expr;
@@ -1373,7 +1393,11 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 None
             };
             require!(self.exact(Token::Punct(Punctuation::RBrace)));
-            spanned(Statement::Switch { input: expr, cases, default })
+            spanned(Statement::Switch {
+                input: Box::new(expr),
+                cases: cases.into_boxed_slice(),
+                default,
+            })
         } else if let Some(()) = self.exact_ident("try")? {
             let try_block = require!(self.block(loop_ctx));
             self.skip_phantom_semicolons()?;
@@ -1471,7 +1495,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
     }
 
     // Single-line statements. Can appear in for loops. Followed by a semicolon.
-    fn simple_statement(&mut self, in_for: bool, vars: &mut Vec<(Location, VarType, String)>) -> Status<Statement> {
+    fn simple_statement(&mut self, in_for: bool, vars: &mut Vec<(Location, VarType, Ident)>) -> Status<Statement> {
         if let Some(()) = self.exact_ident("var")? {
             // statement :: 'var' type_path name ('=' value)
             let mut var_stmts = Vec::new();
@@ -1523,9 +1547,9 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 let (input_types, in_list) = if !in_for {
                     require!(self.input_specifier())
                 } else {
-                    (InputType::default(), None)
+                    (None, None)
                 };
-                if !input_types.is_empty() || in_list.is_some() {
+                if input_types.is_some() || in_list.is_some() {
                     self.error("'as' clause has no effect on local variables")
                         .set_severity(Severity::Warning)
                         .with_errortype("as_local_var")
@@ -1538,17 +1562,20 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 }
             }
             if var_stmts.len() == 1 {
-                success(Statement::Var(var_stmts.remove(0)))
+                success(Statement::Var(Box::new(var_stmts.remove(0))))
             } else {
                 success(Statement::Vars(var_stmts))
             }
         } else if let Some(()) = self.exact_ident("return")? {
+            // statement :: 'return' ';'
             // statement :: 'return' expression ';'
             let expression = self.expression()?;
             success(Statement::Return(expression))
         } else if let Some(()) = self.exact_ident("CRASH")? {
+            // statement :: 'CRASH' '(' ')'
+            // statement :: 'CRASH' '(' expression ')'
             require!(self.exact(Token::Punct(Punctuation::LParen)));
-            let expression = require!(self.expression());
+            let expression = self.expression()?;
             require!(self.exact(Token::Punct(Punctuation::RParen)));
             success(Statement::Crash(expression))
         } else if let Some(()) = self.exact_ident("throw")? {
@@ -1572,9 +1599,9 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
     fn for_range(
         &mut self,
         var_type: Option<VarType>,
-        name: String,
-        start: Expression,
-        end: Expression,
+        name: Ident,
+        start: Box<Expression>,
+        end: Box<Expression>,
     ) -> Status<Statement> {
         // step 2
         let step = if let Some(()) = self.exact_ident("step")? {
@@ -1590,7 +1617,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             name,
             start,
             end,
-            step,
+            step: step.map(Box::new),
             block: require!(self.block(&LoopContext::ForRange)),
         })
     }
@@ -1628,11 +1655,11 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
 
     // distinct from a tree_path, path must begin with a path separator and can
     // use any path separator rather than just slash, AND can be followed by vars
-    fn prefab(&mut self) -> Status<Prefab> {
+    fn prefab(&mut self) -> Status<Box<Prefab>> {
         self.prefab_ex(Vec::new())
     }
 
-    fn prefab_ex(&mut self, mut parts: TypePath) -> Status<Prefab> {
+    fn prefab_ex(&mut self, mut parts: TypePath) -> Status<Box<Prefab>> {
         // path :: path_sep ident (path_sep ident?)*
         // path_sep :: '/' | '.' | ':'
         let start = self.updated_location();
@@ -1640,7 +1667,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
         // expect at least one path element
         let sep = match self.path_separator()? {
             Some(sep) => sep,
-            None if !parts.is_empty() => return Ok(Some(Prefab::from(parts))),
+            None if !parts.is_empty() => return Ok(Some(Box::new(Prefab::from(parts)))),
             None => return Ok(None),
         };
         let mut separator_loc = self.location;
@@ -1685,14 +1712,14 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             })?;
         }
 
-        success(Prefab { path: parts, vars })
+        success(Box::new(Prefab { path: parts, vars }))
     }
 
     fn expression(&mut self) -> Status<Expression> {
-        self.expression_ex(false)
+        self.expression_ex(None, false)
     }
 
-    fn expression_ex(&mut self, in_ternary: bool) -> Status<Expression> {
+    fn expression_ex(&mut self, strength: Option<Strength>, in_ternary: bool) -> Status<Expression> {
         let mut expr = leading!(self.group(in_ternary));
         loop {
             // try to read the next operator
@@ -1705,14 +1732,22 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 }
             };
 
+            // If we're a sub-expression within a ternary expression, don't try to read further than our parent's precedence would allow
+            if let Some(strength) = strength {
+                if info.strength > strength {
+                    self.put_back(Token::Punct(info.token));
+                    break;
+                }
+            }
+
             // trampoline high-strength expression parts as the lhs of the newly found op
-            expr = require!(self.expression_part(expr, info,
+            expr = require!(self.expression_part(expr, info, strength,
                 in_ternary || info.strength == Strength::Conditional));
         }
         success(expr)
     }
 
-    fn expression_part(&mut self, lhs: Expression, prev_op: OpInfo, in_ternary: bool) -> Status<Expression> {
+    fn expression_part(&mut self, lhs: Expression, prev_op: OpInfo, strength: Option<Strength>, in_ternary: bool) -> Status<Expression> {
         use std::cmp::Ordering;
 
         let mut bits = vec![lhs];
@@ -1733,7 +1768,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             match info.strength.cmp(&prev_op.strength) {
                 Ordering::Less => {
                     // the operator is stronger than us... recurse down
-                    rhs = require!(self.expression_part(rhs, info,
+                    rhs = require!(self.expression_part(rhs, info, strength,
                         in_ternary || info.strength == Strength::Conditional));
                 }
                 Ordering::Greater => {
@@ -1757,7 +1792,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 rhs = Expression::BinaryOp {
                     op: BinaryOp::To,
                     lhs: Box::new(rhs),
-                    rhs: Box::new(require!(self.expression_ex(in_ternary))),
+                    rhs: Box::new(require!(self.expression_ex(Some(Strength::In), in_ternary))),
                 };
                 // "step" could appear here but doesn't actually do anything.
                 // In for statements it is parsed by `for_range`.
@@ -1770,10 +1805,13 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 match self.next("':'")? {
                     Token::Punct(Punctuation::Colon) |
                     Token::Punct(Punctuation::CloseColon) => {}
-                    _ => return self.parse_error(),
+                    other => {
+                        self.put_back(other);
+                        return self.parse_error()
+                    }
                 }
                 // Read the else branch.
-                let else_ = match self.expression()? {
+                let else_ = match self.expression_ex(Some(Strength::Conditional), true)? {
                     Some(else_) => else_,
                     None => {
                         self.error("missing else arm of conditional operator should be replaced with 'null'")
@@ -1861,17 +1899,17 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
 
         success(Expression::Base {
             unary: unary_ops,
-            term,
+            term: Box::new(term),
             follow,
         })
     }
 
-    fn term(&mut self, belongs_to: &mut Vec<String>) -> Status<Spanned<Term>> {
+    fn term(&mut self, belongs_to: &mut Vec<Ident>) -> Status<Spanned<Term>> {
         use super::lexer::Punctuation::*;
 
         let start = self.updated_location();
         let term = match self.next("term")? {
-            // term :: 'new' (prefab | (ident (index | field)*))? arglist?
+            // term :: 'new' (prefab | (ident field*))? arglist?
             Token::Ident(ref i, _) if i == "new" => {
                 // It's not entirely clear what is supposed to be valid here.
                 // Some things definitely are:
@@ -1879,7 +1917,6 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 //   * new /obj()
                 //   * new /obj{name = "foo"}()
                 //   * new .relative/path()
-                //   * new some_list[0]()
                 //   * new various.field.accesses()
                 // But some things definitely aren't:
                 //   * new some_proc()() - first parens belong to the 'new'
@@ -1902,7 +1939,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
                 } else if let Some(ident) = self.ident()? {
                     let mut fields = Vec::new();
                     let mut belongs_to = vec![ident.clone()];
-                    while let Some(item) = self.index_or_field(&mut belongs_to, false)? {
+                    while let Some(item) = self.field(&mut belongs_to, false)? {
                         fields.push(item);
                     }
                     NewType::MiniExpr { ident, fields }
@@ -1987,7 +2024,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             // term :: 'as' '(' input_type ')'
             Token::Ident(ref i, _) if i == "as" => {
                 require!(self.exact(Token::Punct(Punctuation::LParen)));
-                let input_type = self.input_type()?.unwrap_or_default();
+                let input_type = self.input_type()?.unwrap_or_else(InputType::empty);
                 require!(self.exact(Token::Punct(Punctuation::RParen)));
                 Term::As(input_type)
             },
@@ -2043,7 +2080,10 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
 
             // term :: str_lit | num_lit
             Token::String(val) => Term::String(val),
-            Token::Resource(val) => Term::Resource(val),
+            Token::Resource(val) => {
+                self.annotate_precise(start..start.add_columns(2 + val.len() as u16), || Annotation::Resource(val.as_str().into()));
+                Term::Resource(val)
+            },
             Token::Int(val) => Term::Int(val),
             Token::Float(val) => Term::Float(val),
 
@@ -2084,23 +2124,36 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
         success(Spanned::new(start, term))
     }
 
-    fn follow(&mut self, belongs_to: &mut Vec<String>, in_ternary: bool) -> Status<Spanned<Follow>> {
+    fn list_access(&mut self, belongs_to: &mut Vec<Ident>) -> Status<Spanned<Follow>> {
         let first_location = self.updated_location();
-        let kind = match self.next("field access")? {
-            // follow :: '[' expression ']'
-            Token::Punct(Punctuation::LBracket) => {
-                belongs_to.clear();
-                let expr = require!(self.expression());
-                require!(self.exact(Token::Punct(Punctuation::RBracket)));
-                return success(Spanned::new(first_location, Follow::Index(Box::new(expr))))
-            }
 
-            // follow :: '.' ident arglist?
+        // follow :: ('[' | '?[') expression ']'
+        let kind = match self.next("field access")? {
+            Token::Punct(Punctuation::LBracket) => ListAccessKind::Normal,
+            Token::Punct(Punctuation::SafeLBracket) => ListAccessKind::Safe,
+            other => return self.try_another(other),
+        };
+
+        belongs_to.clear();
+        let expr = require!(self.expression());
+        require!(self.exact(Token::Punct(Punctuation::RBracket)));
+        success(Spanned::new(first_location, Follow::Index(kind, Box::new(expr))))
+    }
+
+    fn follow(&mut self, belongs_to: &mut Vec<Ident>, in_ternary: bool) -> Status<Spanned<Follow>> {
+        let first_location = self.updated_location();
+
+        if let Some(follow) = self.list_access(belongs_to)? {
+            return success(follow);
+        }
+
+        // follow :: '.' ident arglist?
+        let kind = match self.next("field access")? {
             // TODO: only apply these rules if there is no whitespace around the punctuation
-            Token::Punct(Punctuation::Dot) => IndexKind::Dot,
-            Token::Punct(Punctuation::CloseColon) if !belongs_to.is_empty() || !in_ternary => IndexKind::Colon,
-            Token::Punct(Punctuation::SafeDot) => IndexKind::SafeDot,
-            Token::Punct(Punctuation::SafeColon) => IndexKind::SafeColon,
+            Token::Punct(Punctuation::Dot) => PropertyAccessKind::Dot,
+            Token::Punct(Punctuation::CloseColon) if !belongs_to.is_empty() || !in_ternary => PropertyAccessKind::Colon,
+            Token::Punct(Punctuation::SafeDot) => PropertyAccessKind::SafeDot,
+            Token::Punct(Punctuation::SafeColon) => PropertyAccessKind::SafeColon,
 
             other => return self.try_another(other),
         };
@@ -2141,23 +2194,15 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
     }
 
     // TODO: somehow fix the fact that this is basically copy-pasted from
-    // follow() above, except for the very end.
-    fn index_or_field(&mut self, belongs_to: &mut Vec<String>, in_ternary: bool) -> Status<IndexOrField> {
+    // follow() above.
+    fn field(&mut self, belongs_to: &mut Vec<Ident>, in_ternary: bool) -> Status<Field> {
         let kind = match self.next("field access")? {
-            // follow :: '[' expression ']'
-            Token::Punct(Punctuation::LBracket) => {
-                belongs_to.clear();
-                let expr = require!(self.expression());
-                require!(self.exact(Token::Punct(Punctuation::RBracket)));
-                return success(IndexOrField::Index(Box::new(expr)))
-            }
-
             // follow :: '.' ident
             // TODO: only apply these rules if there is no whitespace around the punctuation
-            Token::Punct(Punctuation::Dot) => IndexKind::Dot,
-            Token::Punct(Punctuation::CloseColon) if !belongs_to.is_empty() || !in_ternary => IndexKind::Colon,
-            Token::Punct(Punctuation::SafeDot) => IndexKind::SafeDot,
-            Token::Punct(Punctuation::SafeColon) => IndexKind::SafeColon,
+            Token::Punct(Punctuation::Dot) => PropertyAccessKind::Dot,
+            Token::Punct(Punctuation::CloseColon) if !belongs_to.is_empty() || !in_ternary => PropertyAccessKind::Colon,
+            Token::Punct(Punctuation::SafeDot) => PropertyAccessKind::SafeDot,
+            Token::Punct(Punctuation::SafeColon) => PropertyAccessKind::SafeColon,
 
             other => return self.try_another(other),
         };
@@ -2182,11 +2227,11 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
             self.annotate_precise(start..end, || Annotation::ScopedVar(belongs_to.clone(), ident.clone()));
             belongs_to.push(ident.clone());
         }
-        success(IndexOrField::Field(kind, ident))
+        success(Field { kind, ident })
     }
 
     /// a parenthesized, comma-separated list of expressions
-    fn arguments(&mut self, parents: &[String], proc: &str) -> Status<Vec<Expression>> {
+    fn arguments(&mut self, parents: &[Ident], proc: &str) -> Status<Vec<Expression>> {
         leading!(self.exact(Token::Punct(Punctuation::LParen)));
         let start = self.location;
 
@@ -2288,7 +2333,7 @@ impl<'ctx, 'an, 'inp> Parser<'ctx, 'an, 'inp> {
     }
 }
 
-fn reconstruct_path(node: &str, proc_kind: Option<ProcDeclKind>, var_type: Option<&VarType>, last: &str) -> Vec<String> {
+fn reconstruct_path(node: &str, proc_kind: Option<ProcDeclKind>, var_type: Option<&VarType>, last: &str) -> Vec<Ident> {
     let mut result = Vec::new();
     for entry in node.split('/').skip(1) {
         result.push(entry.to_owned());

@@ -92,7 +92,7 @@ impl Context {
 
 #[derive(StructOpt, Debug)]
 #[structopt(name="dmm-tools",
-author="Copyright (C) 2017-2020  Tad Hardesty",
+author="Copyright (C) 2017-2021  Tad Hardesty",
 about="This program comes with ABSOLUTELY NO WARRANTY. This is free software,
 and you are welcome to redistribute it under the conditions of the GNU
 General Public License version 3.")]
@@ -238,7 +238,7 @@ fn run(opt: &Opt, command: &Command, context: &mut Context) {
                 ..
             } = *context;
 
-            let render_passes = &dmm_tools::render_passes::configure(enable, disable);
+            let render_passes = &dmm_tools::render_passes::configure(&context.dm_context.config().map_renderer, enable, disable);
             let paths: Vec<&Path> = files.iter().map(|p| p.as_ref()).collect();
             let errors: RwLock<HashSet<String>> = Default::default();
 

@@ -65,6 +65,8 @@ pub struct StackFrame {
     pub dot: ValueText,
     pub locals: Vec<ValueText>,
     pub args: Vec<ValueText>,
+    pub local_names: Vec<String>,
+    pub arg_names: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -276,6 +278,14 @@ impl Request for BreakpointStepOver {
     const TYPE: &'static str = "breakpoint step over";
 }
 
+// #define MESSAGE_BREAKPOINT_STEP_OVER "breakpoint step over" //Content is empty
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct BreakpointStepOut;
+
+impl Request for BreakpointStepOut {
+    const TYPE: &'static str = "breakpoint step out";
+}
+
 // #define MESSAGE_BREAKPOINT_RESUME "breakpoint resume" //Content is empty
 #[derive(Serialize, Deserialize, Debug)]
 pub struct BreakpointResume;
@@ -414,6 +424,8 @@ pub enum BreakpointHitReason {
     BreakpointOpcode,
     #[serde(rename = "step")]
     Step,
+    #[serde(rename = "pause")]
+    Pause,
     #[serde(other)]
     Unknown,
 }
@@ -424,7 +436,10 @@ impl Response for BreakpointHit {
 
 // #define MESSAGE_CALL_STACK "call stack" //Content is a vector of proc paths
 #[derive(Deserialize, Debug)]
-pub struct CallStack(pub Vec<StackFrame>);
+pub struct CallStack {
+    pub current: Vec<StackFrame>,
+    pub suspended: Vec<Vec<StackFrame>>,
+}
 
 impl Response for CallStack {
     const TYPE: &'static str = "call stack";

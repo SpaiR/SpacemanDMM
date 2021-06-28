@@ -5,11 +5,12 @@ use std::path::Path;
 
 use linked_hash_map::LinkedHashMap;
 use ordered_float::OrderedFloat;
+use color_space::{Hsl, Hsv, Lch, Rgb};
 
-use super::{DMError, Location, HasLocation, Context};
-use super::objtree::*;
 use super::ast::*;
+use super::objtree::*;
 use super::preprocessor::DefineMap;
+use super::{Context, DMError, HasLocation, Location, Severity};
 
 /// An absolute typepath and optional variables.
 ///
@@ -17,7 +18,7 @@ use super::preprocessor::DefineMap;
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
 pub struct Pop {
     pub path: TreePath,
-    pub vars: LinkedHashMap<String, Constant>,
+    pub vars: LinkedHashMap<Ident, Constant>,
 }
 
 impl From<TreePath> for Pop {
@@ -70,7 +71,7 @@ pub enum Constant {
 // upstream properties without having to wrap/unwrap at all hours of the day.
 impl std::hash::Hash for Constant {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(&self).hash(state);
+        std::mem::discriminant(self).hash(state);
         match self {
             Constant::Null(p) => p.hash(state),
             Constant::New { type_, args } => (type_, args).hash(state),
@@ -121,6 +122,8 @@ pub enum ConstFn {
     Filter,
     /// The `file()` annotator (marks a string as `isfile`).
     File,
+    /// The `generator()` type constructor.
+    Generator,
 }
 
 /// A constant-evaluation error (usually type mismatch).
@@ -147,10 +150,7 @@ impl Constant {
 
     #[inline]
     pub fn is_null(&self) -> bool {
-        match *self {
-            Constant::Null(_) => true,
-            _ => false,
-        }
+        matches!(*self, Constant::Null(_))
     }
 
     pub fn to_bool(&self) -> bool {
@@ -386,6 +386,7 @@ impl fmt::Display for ConstFn {
             ConstFn::Sound => "sound",
             ConstFn::Filter => "filter",
             ConstFn::File => "file",
+            ConstFn::Generator => "generator",
         })
     }
 }
@@ -478,7 +479,7 @@ fn constant_ident_lookup(
             .cloned()
         {
             Some(decl) => decl,
-            None => return Ok(ConstLookup::Continue(None)),  // definitely doesn't exist
+            None => return Ok(ConstLookup::Continue(None)), // definitely doesn't exist
         };
 
         let type_ = &mut tree[ty];
@@ -719,7 +720,7 @@ impl<'a> ConstantFolder<'a> {
             Term::Null => Constant::Null(type_hint.cloned()),
             Term::New { type_, args } => Constant::New {
                 type_: match type_ {
-                    NewType::Prefab(e) => Some(self.prefab(e)?),
+                    NewType::Prefab(e) => Some(self.prefab(*e)?),
                     NewType::Implicit => None,
                     NewType::MiniExpr { .. } => return Err(self.error("non-constant new expression")),
                 },
@@ -736,39 +737,20 @@ impl<'a> ConstantFolder<'a> {
                 "icon" => Constant::Call(ConstFn::Icon, self.arguments(args)?),
                 "sound" => Constant::Call(ConstFn::Sound, self.arguments(args)?),
                 "file" => Constant::Call(ConstFn::File, self.arguments(args)?),
+                "generator" => Constant::Call(ConstFn::Generator, self.arguments(args)?),
                 // constant-evaluatable functions
                 "sin" => self.trig_op(args, f32::sin)?,
                 "cos" => self.trig_op(args, f32::cos)?,
                 "arcsin" => self.trig_op(args, f32::asin)?,
                 "arccos" => self.trig_op(args, f32::acos)?,
-                "rgb" => {
-                    use std::fmt::Write;
-                    if args.len() != 3 && args.len() != 4 {
-                        return Err(self.error(format!("malformed rgb() call, must have 3 or 4 arguments and instead has {}", args.len())));
-                    }
-                    let mut result = String::with_capacity(7);
-                    result.push_str("#");
-                    for each in args {
-                        if let Some(i) = self.expr(each, None)?.to_int() {
-                            let clamped = std::cmp::max(::std::cmp::min(i, 255), 0);
-                            let _ = write!(result, "{:02x}", clamped);
-                        } else {
-                            return Err(self.error("malformed rgb() call, argument wasn't an int"));
-                        }
-                    }
-                    Constant::String(result)
-                },
+                "rgb" => Constant::String(self.rgb(args)?),
                 "defined" if self.defines.is_some() => {
                     let defines = self.defines.unwrap();  // annoying, but keeps the match clean
                     if args.len() != 1 {
                         return Err(self.error(format!("malformed defined() call, must have 1 argument and instead has {}", args.len())));
                     }
-                    match args[0] {
-                        Expression::Base {
-                            ref unary,
-                            term: Spanned { elem: Term::Ident(ref ident), .. },
-                            ref follow
-                        } if unary.is_empty() && follow.is_empty() => {
+                    match args[0].as_term() {
+                        Some(Term::Ident(ref ident)) => {
                             Constant::Int(if defines.contains_key(ident) { 1 } else { 0 })
                         },
                         _ => return Err(self.error("malformed defined() call, argument given isn't an Ident.")),
@@ -777,7 +759,7 @@ impl<'a> ConstantFolder<'a> {
                 // other functions are no-goes
                 _ => return Err(self.error(format!("non-constant function call: {}", ident))),
             },
-            Term::Prefab(prefab) => Constant::Prefab(self.prefab(prefab)?),
+            Term::Prefab(prefab) => Constant::Prefab(self.prefab(*prefab)?),
             Term::Ident(ident) => self.ident(ident, false)?,
             Term::String(v) => Constant::String(v),
             Term::Resource(v) => Constant::Resource(v),
@@ -827,7 +809,7 @@ impl<'a> ConstantFolder<'a> {
         Ok(Pop { path, vars })
     }
 
-    fn vars(&mut self, input: LinkedHashMap<String, Expression>) -> Result<LinkedHashMap<String, Constant>, DMError> {
+    fn vars(&mut self, input: LinkedHashMap<Ident, Expression>) -> Result<LinkedHashMap<Ident, Constant>, DMError> {
         // Visit the vars recursively.
         let mut vars = LinkedHashMap::new();
         for (k, v) in input {
@@ -837,7 +819,7 @@ impl<'a> ConstantFolder<'a> {
         Ok(vars)
     }
 
-    fn ident(&mut self, ident: String, must_be_const: bool) -> Result<Constant, DMError> {
+    fn ident(&mut self, ident: Ident, must_be_const: bool) -> Result<Constant, DMError> {
         let ty = self.ty;
         self.recursive_lookup(ty, &ident, must_be_const)
     }
@@ -847,7 +829,7 @@ impl<'a> ConstantFolder<'a> {
         while let Some(ty) = idx {
             let location = self.location;
             if self.tree.is_none() {
-                return Err(self.error("cannot reference variables in this context"));
+                return Err(self.error(format!("cannot reference variable {:?} in this context", ident)));
             }
             let tree = self.tree.as_mut().unwrap();
             match constant_ident_lookup(tree, ty, &ident, must_be_const)
@@ -858,5 +840,182 @@ impl<'a> ConstantFolder<'a> {
             }
         }
         Err(self.error(format!("unknown variable: {}", ident)))
+    }
+
+    fn rgb(&mut self, args: Vec<Expression>) -> Result<String, DMError> {
+        enum ColorSpace {
+            Rgb = 0,
+            Hsv = 1,
+            Hsl = 2,
+            Hcy = 3,
+        }
+
+        #[derive(Default)]
+        struct ColorArgs {
+            r: bool,
+            g: bool,
+            b: bool,
+            h: bool,
+            s: bool,
+            v: bool,
+            l: bool,
+            c: bool,
+            y: bool,
+            a: Option<i32>,
+        }
+
+        if args.len() != 3 && args.len() != 4 && args.len() != 5 {
+            return Err(self.error(format!("malformed rgb() call, must have 3, 4, or 5 arguments and instead has {}", args.len())));
+        }
+
+        let arguments = self.arguments(args)?;
+        let mut space = None;
+        let mut color_args = ColorArgs::default();
+
+        // Get the value of the `space` kwarg if present, or collect which kwargs are set to automatically determine the color space.
+        for (value, potential_kwarg_value) in &arguments {
+            // Check for kwargs if we're in the right form
+            if let Some(kwarg_value) = potential_kwarg_value {
+                if let Some(kwarg) = value.as_str() {
+                    match kwarg {
+                        "r" | "red" => color_args.r = true,
+                        "g" | "green" => color_args.g = true,
+                        "b" | "blue" => color_args.b = true,
+                        "h" | "hue" => color_args.h = true,
+                        "s" | "saturation" => color_args.s = true,
+                        "v" | "value" => color_args.v = true,
+                        "l" | "luminance" => color_args.l = true,
+                        "c" | "chroma" => color_args.c = true,
+                        "y" => color_args.y = true,
+                        "a" | "alpha" => color_args.a = kwarg_value.to_int(),
+                        "space" => match kwarg_value.to_int() { // Do we have an actual colorspace specified? Set the values.
+                            Some(0) => space = Some(ColorSpace::Rgb),
+                            Some(1) => space = Some(ColorSpace::Hsv),
+                            Some(2) => space = Some(ColorSpace::Hsl),
+                            Some(3) => space = Some(ColorSpace::Hcy),
+                            _ => {
+                                return Err(self.error(format!("malformed rgb() call, bad color space: {}", kwarg_value)))
+                            }
+                        }
+                        _ => {
+                            return Err(self.error(format!("malformed rgb() call, bad kwarg passed: {}", kwarg)))
+                        }
+                    }
+                } else {
+                    return Err(self.error(format!("malformed rgb() call, kwarg is not string: {}", value)));
+                }
+            }
+        }
+
+        // Only set space if it wasn't set manually by the space arg
+        let space = if let Some(space) = space {
+            space
+        } else {
+            if color_args.r || color_args.g || color_args.b {
+                // TODO: Add hint here for useless r/g/b kwarg
+                ColorSpace::Rgb
+            } else if color_args.h {
+                if color_args.c && color_args.y {
+                    ColorSpace::Hcy
+                } else if color_args.s {
+                    if color_args.v {
+                        ColorSpace::Hsv
+                    } else if color_args.l {
+                        ColorSpace::Hsl
+                    } else {
+                        return Err(self.error("malformed rgb() call, could not determine space: only h & s specified"));
+                    }
+                } else {
+                    return Err(self.error("malformed rgb() call, could not determine space: only h specified"));
+                }
+            } else {
+                ColorSpace::Rgb  // Default
+            }
+        };
+
+        let mut value_vec: Vec<f64> = vec![];
+
+        for (arg_pos, (value, potential_kwarg_value)) in arguments.iter().enumerate() {
+            let mut to_check = value;
+
+            // Determines the range based on predetermined colorspace
+            let mut range = match arg_pos {
+                0 => match space {
+                    ColorSpace::Rgb => 0..=255, //r
+                    ColorSpace::Hsv => 0..=360, //h
+                    ColorSpace::Hsl => 0..=360, //h
+                    ColorSpace::Hcy => 0..=360, //h
+                },
+                1 => match space {
+                    ColorSpace::Rgb => 0..=255, //g
+                    ColorSpace::Hsv => 0..=100, //s
+                    ColorSpace::Hsl => 0..=100, //s
+                    ColorSpace::Hcy => 0..=100, //c
+                },
+                2 => match space {
+                    ColorSpace::Rgb => 0..=255, //b
+                    ColorSpace::Hsv => 0..=100, //v
+                    ColorSpace::Hsl => 0..=100, //l
+                    ColorSpace::Hcy => 0..=100, //y
+                },
+                _ => 0..=255,
+            };
+
+            // If we have a secondary value, it's a kwarg, we need to get the actual value. If this fails, it's normal.
+            if let Some(kwarg_value) = potential_kwarg_value {
+                if let Some(kwarg) = value.as_str() {
+                    to_check = kwarg_value; // Set the value to actually check to be our associated vaue
+
+                    range = match kwarg {
+                        "r" | "red" | "g" | "green" | "b" | "blue" => 0..=255,
+                        "h" | "hue" => 0..=360,
+                        "s" | "saturation" => 0..=100,
+                        "v" | "value" => 0..=100,
+                        "c" | "chroma" => 0..=100,
+                        "l" | "y" | "luminance" => 0..=100,
+                        "a" | "alpha" => 0..=255,
+                        "space" => continue, // Don't range-check the value of the space
+                        _ => {
+                            return Err(self.error(format!("malformed rgb() call, bad kwarg passed: {}", kwarg)))
+                        }
+                    };
+                } else {
+                    return Err(self.error(format!("malformed rgb() call, kwarg is not string: {}", value)));
+                }
+            }
+
+            if let Some(i) = to_check.to_int() {
+                if !range.contains(&i) {
+                    return Err(self.error(format!("malformed rgb() call, {} is not within the valid range ({}..{})", i, range.start(), range.end()))
+                        .set_severity(Severity::Warning)
+                        .with_location(self.location)
+                    );
+                }
+                let clamped = std::cmp::max(::std::cmp::min(i, *range.end()), *range.start());
+                value_vec.push(clamped.into());
+            } else {
+                return Err(self.error("malformed rgb() call, value wasn't an int"));
+            }
+        }
+
+        assert!(value_vec.len() >= 3); // Make sure we got 3+ values
+
+        // Convert our color given a space to a rgb hexcode
+        let color: Rgb = match space {
+            ColorSpace::Rgb => Rgb::new(value_vec[0], value_vec[1], value_vec[2]),
+            ColorSpace::Hsv => Hsv::new(value_vec[0], value_vec[1] * 0.01, value_vec[2] * 0.01).into(),
+            ColorSpace::Hsl => Hsl::new(value_vec[0], value_vec[1] * 0.01, value_vec[2] * 0.01).into(),
+            ColorSpace::Hcy => Lch::new(value_vec[2], value_vec[1], value_vec[0]).into(),
+        };
+
+        // Extract the raw 4th alpha positional argument if it wasn't a kwarg
+        let alpha = color_args.a.or(value_vec.get(3).map(|&x| x as i32));
+
+        // APPARENTLY the author thinks fractional rgb is a thing, hence the rounding
+        if let Some(alpha) = alpha {
+            Ok(format!("#{:02x}{:02x}{:02x}{:02x}", color.r.round() as u8, color.g.round() as u8, color.b.round() as u8, alpha))
+        } else {
+            Ok(format!("#{:02x}{:02x}{:02x}", color.r.round() as u8, color.g.round() as u8, color.b.round() as u8))
+        }
     }
 }

@@ -11,6 +11,7 @@ use super::{DMError, Location, HasLocation, FileId, Context, Severity};
 use super::lexer::*;
 use super::docs::{DocComment, DocTarget, DocCollection};
 use super::annotation::*;
+use super::ast::Ident;
 
 /// The maximum recursion depth of macro expansion.
 const MAX_RECURSION_DEPTH: usize = 32;
@@ -25,7 +26,7 @@ pub enum Define {
         docs: DocCollection,
     },
     Function {
-        params: Vec<String>,
+        params: Vec<Ident>,
         subst: Vec<Token>,
         variadic: bool,
         docs: DocCollection,
@@ -264,7 +265,7 @@ enum Include<'ctx> {
         lexer: Lexer<'ctx>,
     },
     Expansion {
-        name: String,
+        name: Ident,
         location: Location,
         tokens: VecDeque<Token>,
     },
@@ -306,10 +307,7 @@ impl<'ctx> IncludeStack<'ctx> {
     }
 
     fn in_expansion(&self) -> bool {
-        match self.stack.last() {
-            Some(Include::Expansion { .. }) => true,
-            _ => false,
-        }
+        matches!(self.stack.last(), Some(Include::Expansion { .. }))
     }
 }
 
@@ -394,7 +392,7 @@ pub struct Preprocessor<'ctx> {
     scripts: Vec<PathBuf>,
 
     last_printable_input_loc: Location,
-    danger_idents: HashMap<String, Location>,
+    danger_idents: HashMap<Ident, Location>,
     in_interp_string: u32,
 
     docs_in: VecDeque<(Location, DocComment)>,
@@ -741,9 +739,10 @@ impl<'ctx> Preprocessor<'ctx> {
                     // include searches relevant paths for files
                     "include" if disabled => {}
                     "include" => {
-                        expect_token!((path) = Token::String(path));
+                        expect_token!((path_str) = Token::String(path_str));
+                        let include_loc = _last_expected_loc;
                         expect_token!(() = Token::Punct(Punctuation::Newline));
-                        let path = PathBuf::from(path.replace("\\", "/"));
+                        let path = PathBuf::from(path_str.replace("\\", "/"));
 
                         for candidate in vec![
                             // 1. relative to file in which `#include` appears.
@@ -762,7 +761,7 @@ impl<'ctx> Preprocessor<'ctx> {
                                 DMS,
                                 DM,
                             }
-                            match match candidate.extension().and_then(|s| s.to_str()) {
+                            let file_type = match candidate.extension().and_then(|s| s.to_str()) {
                                 Some("dmm") => FileType::DMM,
                                 Some("dmf") => FileType::DMF,
                                 Some("dms") => FileType::DMS,
@@ -779,7 +778,15 @@ impl<'ctx> Preprocessor<'ctx> {
                                     self.context.register_error(DMError::new(self.last_input_loc, "filename has no extension"));
                                     return Ok(());
                                 }
-                            } {
+                            };
+
+                            if let Some(annotations) = self.annotations.as_mut() {
+                                annotations.insert(
+                                    include_loc .. include_loc.add_columns(2 + path_str.len() as u16),
+                                    Annotation::Include(candidate.clone()));
+                            }
+
+                            match file_type {
                                 FileType::DMM => self.maps.push(candidate),
                                 FileType::DMF => self.skins.push(candidate),
                                 FileType::DMS => self.scripts.push(candidate),
@@ -794,8 +801,10 @@ impl<'ctx> Preprocessor<'ctx> {
                                     Err(e) => self.context.register_error(e),
                                 },
                             }
+
                             return Ok(());
                         }
+
                         self.context.register_error(DMError::new(self.last_input_loc, format!("failed to find #include {:?}", path)));
                         return Ok(());
                     }

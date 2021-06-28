@@ -40,12 +40,16 @@ Raised by DreamChecker:
 * `must_not_sleep` - `SpacemanDMM_should_not_sleep` directive
 * `redefined_proc` - `SpacemanDMM_can_be_redefined` directive
 * `ambiguous_in_lhs` - Raised on ambiguous operations on the left hand side of an `in` operation
+* `ambiguous_not_bitwise` - Raised on an ambiguous `!` on the left hand side of a bitwise operation
 * `no_typehint_implicit_new` - Raised on the use of `new` where no typehint is avaliable
 * `field_access_static_type` - Raised on using `.field_name` on a variable with no typehint
 * `proc_call_static_type` - Raised on using `.proc_name()` on a variable with no typehint
+* `proc_has_no_parent` - Raised on calling `..()` in a proc with no parent.
 * `no_operator_overload` - Raised on using a unary operator on a non-primative that doesn't define it's own override, eg `somemob++`
+* `unreachable_code` - Raised on finding code that can never be executed
 * `control_condition_static` - Raised on a control condition such as `if`/`while` having a static condition such as `1` or `"string"`
 * `if_condition_determinate` - Raised on if condition being always true or always false
+* `loop_condition_determinate` - Raised on loop condition such as in `for` being always true or always false
 
 Raised by Lexer:
 
